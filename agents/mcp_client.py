@@ -36,6 +36,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+from .tool_result import ToolResult
 from .ui import print_error, print_info
 
 # 单行 JSON-RPC 消息的读取上限。asyncio 默认只有 64KB，浏览器快照这类大响应会超限。
@@ -247,7 +248,7 @@ class McpConnection:
             for t in result["tools"]
         ]
 
-    async def call_tool(self, name: str, args: dict, *, timeout: float = 60.0) -> str:
+    async def call_tool(self, name: str, args: dict, *, timeout: float = 60.0) -> ToolResult:
         """调用当前 MCP Server 上的某个工具，并把结果转换成字符串返回。
 
         _send_request 本身不带超时：如果 Server 子进程卡住（比如浏览器工具在
@@ -263,13 +264,17 @@ class McpConnection:
             raise TimeoutError(
                 f"MCP tool '{name}' on server '{self.server_name}' timed out after {timeout}s"
             ) from None
+        # MCP 协议用 isError 表示工具自身执行失败（区别于 JSON-RPC 层的错误）。
+        is_error = bool(isinstance(result, dict) and result.get("isError"))
         if isinstance(result, dict) and isinstance(result.get("content"), list):
             # MCP 工具结果通常是 content block 列表。当前 Agent 只消费 text block。
-            return "\n".join(
+            text = "\n".join(
                 c["text"] for c in result["content"] if c.get("type") == "text"
             )
-        # 如果不是标准 content list，就退回为 JSON 字符串，避免丢失信息。
-        return json.dumps(result)
+        else:
+            # 如果不是标准 content list，就退回为 JSON 字符串，避免丢失信息。
+            text = json.dumps(result)
+        return ToolResult(text, is_error)
 
     async def close(self) -> None:
         """关闭 MCP Server 子进程，并让所有等待中的请求失败。"""
@@ -372,7 +377,7 @@ class McpManager:
         """判断一个工具名是否是 MCP 工具名。"""
         return name.startswith("mcp__")
 
-    async def call_tool(self, prefixed_name: str, args: dict) -> str:
+    async def call_tool(self, prefixed_name: str, args: dict) -> ToolResult:
         """把带前缀的 MCP 工具调用路由到正确的 MCP Server。"""
         # 工具名格式为 mcp__serverName__toolName。
         parts = prefixed_name.split("__")

@@ -237,18 +237,46 @@ def print_divider() -> None:
     console.rule("[dim]turn complete[/dim]", style="dim")
 
 
-def print_cost(input_tokens: int, output_tokens: int) -> None:
+def print_cost(input_tokens: int, output_tokens: int, cost: str) -> None:
+    """cost 由 agent 按模型价格算好后传入（价格未知时是 "unknown ..."），这里只负责展示。"""
     _ensure_fresh_line()
-    cost_in = (input_tokens / 1_000_000) * 3
-    cost_out = (output_tokens / 1_000_000) * 15
-    total = cost_in + cost_out
     table = Table.grid(padding=(0, 2))
     table.add_column(style="cyan")
     table.add_column(style="white")
     table.add_row("input", f"{input_tokens} tokens")
     table.add_row("output", f"{output_tokens} tokens")
-    table.add_row("estimate", f"${total:.4f}")
+    table.add_row("cost", _safe_text(cost))
     console.print(Panel(table, title="Cost", border_style="cyan", box=box.ROUNDED))
+
+
+def print_stats(stats: dict) -> None:
+    """/stats：本会话（含子 agent）的工具调用、失败率、耗时和费用。"""
+    _ensure_fresh_line()
+
+    def ms(v):
+        return "-" if v is None else f"{v / 1000:.2f}s"
+
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="cyan")
+    table.add_column(style="white")
+    table.add_row("model", _safe_text(str(stats.get("model"))))
+    table.add_row("model calls", f"{stats['model_calls']} (retries {stats['model_retries']}, "
+                                 f"p50 {ms(stats['model_latency_ms_p50'])}, first token p50 {ms(stats['ttft_ms_p50'])})")
+    rate = stats["tool_error_rate"]
+    table.add_row("tool calls", f"{stats['tool_calls']} (errors {stats['tool_errors']}"
+                                + (f", {rate:.0%}" if rate is not None else "") + ")")
+    for name, t in stats["tools"].items():
+        table.add_row(f"  {_safe_text(name)}", f"{t['calls']} calls, {t['errors']} errors, p50 {ms(t['p50_ms'])}")
+    table.add_row("tokens", f"{stats['input_tokens']} in / {stats['output_tokens']} out "
+                            f"(cache read {stats['cache_read_tokens']}, write {stats['cache_write_tokens']})")
+    cost = stats["cost_usd"]
+    table.add_row("cost", f"${cost:.4f}" if cost is not None else
+                  f"unknown (known part ${stats['cost_usd_known_part']:.4f})")
+    if stats.get("permissions"):
+        table.add_row("permissions", ", ".join(f"{k} {v}" for k, v in sorted(stats["permissions"].items())))
+    if stats.get("events_file"):
+        table.add_row("events", _safe_text(stats["events_file"]))
+    console.print(Panel(table, title="Session stats", border_style="cyan", box=box.ROUNDED))
 
 
 def print_retry(attempt: int, max_retries: int, reason: str) -> None:

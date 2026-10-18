@@ -14,7 +14,10 @@ from typing import Callable, Awaitable, Any
 import anthropic
 import openai
 
+from agents.events import RunRecorder, new_id, summarize_args
 from agents.mcp_client import McpManager
+from agents.pricing import call_cost_usd, get_price
+from agents.tool_result import ToolResult
 from agents.memory import MemoryPrefetch, start_memory_prefetch, format_memories_for_injection
 from agents.prompt import build_system_prompt
 from agents.session_memory import (
@@ -32,7 +35,7 @@ from agents.tools import ToolDef, tool_definitions, execute_tool, CONCURRENCY_SA
     get_active_tool_definitions
 from agents.ui import print_info, print_divider, print_assistant_text, print_sub_agent_start, print_sub_agent_end, \
     start_spinner, stop_spinner, print_cost, print_tool_call, print_tool_result, print_confirmation, print_retry, \
-    print_error
+    print_error, print_warning
 
 
 # 指数退避重试
@@ -67,13 +70,15 @@ def _sanitize_for_utf8(value: Any) -> Any:
     return value
 
 
-async def _with_retry(fn, max_retries: int = 3):
+async def _with_retry(fn, max_retries: int = 3, on_retry: Callable[[], None] | None = None):
     for attempt in range(max_retries + 1):
         try:
             return await fn()
         except Exception as error:
             if attempt >= max_retries or not _is_retryable(error):
                 raise
+            if on_retry:
+                on_retry()
             delay = min(1000 * (2 ** attempt), 30000) / 1000 + (hash(str(time.time())) % 1000) / 1000
             status = getattr(error, "status_code", None) or getattr(error, "status", None)
             reason = f"HTTP {status}" if status else (getattr(error, "code", None) or "network error")
@@ -145,7 +150,10 @@ class Agent:
                  confirm_fn:Callable[[str], Awaitable[bool]] | None=None,
                  custom_system_prompt: str | None=None,
                  custom_tools: list[ToolDef] | None=None,
-                 is_sub_agent: bool=False,):
+                 is_sub_agent: bool=False,
+                 recorder: RunRecorder | None=None,
+                 trace_parent: dict[str, Any] | None=None,
+                 events_path: Path | None=None,):
         self.permission_mode = permission_mode
         self.thinking = thinking
         self.model = model
@@ -169,6 +177,18 @@ class Agent:
         self.last_input_token_count = 0
         self.current_turns = 0
         self.last_api_call_time = 0
+        # 事件日志、汇总统计和累计费用；子 agent 与父 agent 共用同一个 recorder。
+        self._recorder = recorder or RunRecorder(self.session_id, path=events_path)
+        trace_parent = trace_parent or {}
+        self._trace_id: str | None = trace_parent.get("trace_id")
+        self._parent_span_id: str | None = trace_parent.get("parent_span_id")
+        self._agent_label: str = trace_parent.get("label") or ("sub" if is_sub_agent else "main")
+        self._current_span_id: str | None = None
+        self._call_retries = 0
+        self._call_first_token_at: float | None = None
+        if recorder is None and not is_sub_agent and get_price(model) is None:
+            note = "费用将显示为未知" + ("，--max-cost 上限无法生效" if max_cost_usd is not None else "")
+            print_warning(f"模型 {model} 不在价格表中，{note}。可在 settings.json 的 pricing 字段补充价格。")
 
 
         self._aborted = False
@@ -430,13 +450,22 @@ class Agent:
 
         self._aborted = False
         self._turn_output_buffer = []
+        if not self._parent_span_id:
+            # 主 agent 每轮用户输入一个 trace；子 agent 沿用父 agent 的 trace。
+            self._trace_id = new_id()
+        turn_started = time.monotonic()
+        turns_before = self.current_turns
+        turn_error: str | None = None
+        self._recorder.emit("turn_start", input_chars=len(original_user_message), **self._trace_fields())
         coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
         self._current_task = asyncio.create_task(coro)
         try:
             await self._current_task
         except asyncio.CancelledError:
             self._aborted = True
-        except Exception:
+        except Exception as e:
+            turn_error = f"{type(e).__name__}: {e}"
+            self._recorder.emit("error", where="chat", error=turn_error, **self._trace_fields())
             # 模型调用重试用尽等异常照常向上抛，但先把这一轮已有的输入和工具结果存盘。
             if not self.is_sub_agent:
                 self._auto_save()
@@ -444,6 +473,11 @@ class Agent:
         finally:
             self._current_task = None
             await self._cancel_inflight_tool_tasks()
+            self._recorder.emit(
+                "turn_end", duration_ms=round((time.monotonic() - turn_started) * 1000),
+                turns=self.current_turns - turns_before, aborted=self._aborted, error=turn_error,
+                **self._trace_fields(),
+            )
         assistant_text = "".join(self._turn_output_buffer or []).strip()
         self._turn_output_buffer = None
         if not self.is_sub_agent and not self._aborted:
@@ -533,13 +567,84 @@ class Agent:
         self._same_tool_repeat_count = 0
         self._last_tool_name = ""
 
-    def _looks_like_tool_failure(self, tool_name: str, raw: str, result: str) -> bool:
-        text = f"{raw}\n{result}".lower()
-        if any(marker in text for marker in ("error", "denied", "timed out", "timeout")):
-            return True
-        if tool_name == "compact_context" and "no context compaction" in text:
-            return True
-        return False
+    # ── 工具执行的公共收尾：两套主循环都走这里 ─────────────────────────
+    def _trace_fields(self, span_id: str | None = None) -> dict[str, Any]:
+        fields: dict[str, Any] = {"trace_id": self._trace_id, "agent": self._agent_label}
+        if span_id:
+            fields["span_id"] = span_id
+        if self._parent_span_id:
+            fields["parent_span_id"] = self._parent_span_id
+        return fields
+
+    async def _timed_tool_call(self, name: str, inp: dict, span_id: str) -> ToolResult:
+        """执行一次工具调用并计时。除取消外不抛异常：异常转成错误结果，避免一个工具拖垮整轮。"""
+        started = time.monotonic()
+        previous_span, self._current_span_id = self._current_span_id, span_id
+        try:
+            result = await self._execute_tool_call(name, inp)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            result = ToolResult.error(f"Error executing tool: {e}")
+        finally:
+            self._current_span_id = previous_span
+        if not isinstance(result, ToolResult):
+            result = ToolResult.ok(str(result))
+        result.meta.setdefault("duration_ms", (time.monotonic() - started) * 1000)
+        return result
+
+    def _finish_tool_call(self, name: str, inp: dict, result: ToolResult, *, span_id: str,
+                          early: bool = False) -> ToolResult:
+        """截断或落盘 → 打印 → 记录成败 → 写事件。"""
+        content = self._persist_large_result(name, _safe_utf8_text(result.content))
+        print_tool_result(name, content)
+        self._record_tool_outcome(name, not result.is_error)
+        meta = {k: v for k, v in result.meta.items() if k in ("exit_code", "timed_out")}
+        self._recorder.record_tool_call(
+            tool=name, is_error=result.is_error, duration_ms=result.meta.get("duration_ms"),
+            early=early, result_bytes=len(content.encode()), args=summarize_args(inp),
+            **meta, **self._trace_fields(span_id),
+        )
+        result.content = content
+        return result
+
+    async def _authorize_tool(self, name: str, inp: dict, span_id: str) -> ToolResult | None:
+        """权限判定 + 必要时询问用户。返回 None 表示放行，否则返回交给模型的拒绝结果。"""
+        perm = check_permission(name, inp, self.permission_mode, self._plan_file_path)
+        message = perm.get("message", "")
+        trace = self._trace_fields(span_id)
+        if perm["action"] == "deny":
+            print_info(f"Denied: {message}")
+            self._record_tool_outcome(name, False)
+            self._recorder.record_permission(tool=name, decision="deny", reason=message, **trace)
+            return ToolResult.error(f"Action denied: {message}")
+        if perm["action"] == "confirm" and message:
+            if message in self._confirmed_paths:
+                self._recorder.record_permission(tool=name, decision="allow_cached", reason=message, **trace)
+                return None
+            confirmed = await self._confirm_dangerous(message)
+            self._recorder.record_permission(
+                tool=name, decision="user_approved" if confirmed else "user_denied", reason=message, **trace)
+            if not confirmed:
+                self._record_tool_outcome(name, False)
+                return ToolResult.error("User denied this action.")
+            self._confirmed_paths.add(message)
+            return None
+        self._recorder.record_permission(tool=name, decision="allow", **trace)
+        return None
+
+    @staticmethod
+    def _anthropic_tool_result(tool_use_id: str, result: ToolResult) -> dict:
+        block = {"type": "tool_result", "tool_use_id": tool_use_id, "content": result.content}
+        if result.is_error:
+            block["is_error"] = True
+        return block
+
+    @staticmethod
+    def _openai_tool_message(tool_call_id: str, result: ToolResult) -> dict:
+        # OpenAI 协议没有 is_error 字段，用统一前缀告诉模型这次调用失败了。
+        content = f"[tool error] {result.content}" if result.is_error else result.content
+        return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
 
     def _augment_user_message_with_skill_context(self, user_message: str) -> tuple[str, dict[str, Any] | None]:
         try:
@@ -749,15 +854,33 @@ class Agent:
         print_info("Conversation cleared.")
 
     def show_cost(self):
-        total = self._get_current_cost_usd()
         budget_info = f" / ${self.max_cost_usd} budget" if self.max_cost_usd else ""
         turn_info = f" | Turns: {self.current_turns}/{self.max_turns}" if self.max_turns else ""
+        cache_info = (f" | cache read {self._recorder.cache_read_tokens} / write {self._recorder.cache_write_tokens}"
+                      if self._recorder.cache_read_tokens or self._recorder.cache_write_tokens else "")
         print_info(
-            f"Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out\n  Estimated cost: ${total:.4f}{budget_info}{turn_info}")
+            f"Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out{cache_info}\n"
+            f"  Cost: {self._format_cost()}{budget_info}{turn_info}")
 
-    #获取当前的花费，
+    def _format_cost(self) -> str:
+        r = self._recorder
+        if r.cost_unknown:
+            return f"unknown (known part ${r.cost_usd:.4f})" if r.cost_usd else "unknown (model not in price table)"
+        return f"${r.cost_usd:.4f}"
+
+    def get_run_stats(self) -> dict[str, Any]:
+        """本会话（含子 agent）的汇总统计，供 /stats 和评测 runner 使用。"""
+        return {
+            "model": self.model,
+            "turns": self.current_turns,
+            "input_tokens": self.total_input_tokens,
+            "output_tokens": self.total_output_tokens,
+            **self._recorder.summary(),
+        }
+
+    #获取当前的花费（按模型价格逐次累加，子 agent 的花费实时计入同一个 recorder）
     def _get_current_cost_usd(self) -> float:
-        return (self.total_input_tokens / 1_000_000) * 3 + (self.total_output_tokens / 1_000_000) * 15
+        return self._recorder.cost_usd
 
     #检查预算
     def _check_budget(self) -> dict:
@@ -865,10 +988,18 @@ class Agent:
             await self._compact_conversation(trigger="auto")
 
     async def _compact_conversation(self, *, trigger: str = "manual")->bool:
+        messages_before = self._get_message_count()
+        tokens_before = self.last_input_token_count
+        started = time.monotonic()
         if self.use_openai:
             compacted = await self._compact_openai(trigger=trigger)
         else:
             compacted = await self._compact_anthropic(trigger=trigger)
+        self._recorder.emit(
+            "compaction", trigger=trigger, compacted=compacted, messages_before=messages_before,
+            messages_after=self._get_message_count(), context_tokens_before=tokens_before,
+            duration_ms=round((time.monotonic() - started) * 1000), **self._trace_fields(),
+        )
         if compacted:
             print_info("Conversation compacted.")
         return compacted
@@ -1106,11 +1237,11 @@ class Agent:
 
     #执行工具入口
 
-    async def _execute_tool_call(self, name: str, inp: dict) -> str:
+    async def _execute_tool_call(self, name: str, inp: dict) -> ToolResult:
         if name == "compact_context":
             return await self._execute_compact_context_tool(inp)
         if name in ("enter_plan_mode", "exit_plan_mode"):
-            return await self._execute_plan_mode_tool(name)
+            return ToolResult.ok(await self._execute_plan_mode_tool(name))
         if name == "agent":
             return await self._execute_agent_tool(inp)
         if name == "skill":
@@ -1119,37 +1250,30 @@ class Agent:
         if self._mcp_manager.is_mcp_tool(name):
             return await self._mcp_manager.call_tool(name, inp)
         result = await execute_tool(name, inp, self._read_file_state)
-        if name in {"skill_create", "skill_evolve"}:
-            try:
-                parsed = json.loads(result)
-                if isinstance(parsed, dict) and parsed.get("ok"):
-                    self._refresh_runtime_system_prompt()
-            except Exception:
-                pass
+        if name in {"skill_create", "skill_evolve"} and not result.is_error:
+            self._refresh_runtime_system_prompt()
         return result
 
-    async def _execute_compact_context_tool(self, inp: dict) -> str:
+    async def _execute_compact_context_tool(self, inp: dict) -> ToolResult:
         reason = str(inp.get("reason") or "").strip()
         compacted = await self._compact_conversation(trigger="tool")
         if not compacted:
-            self._record_tool_outcome("compact_context", False)
-            return "No context compaction was performed because there is not enough conversation history yet."
-        self._record_tool_outcome("compact_context", True)
+            return ToolResult.error("No context compaction was performed because there is not enough conversation history yet.")
         self._context_cleared = True
         suffix = f"\nReason: {reason}" if reason else ""
-        return (
+        return ToolResult.ok(
             "Context compacted into structured session memory. "
             "Continue from the folded memory now present in the conversation context."
             f"{suffix}"
         )
 
 
-    async def _execute_skill_tool(self, inp: dict) -> str:
+    async def _execute_skill_tool(self, inp: dict) -> ToolResult:
         from .skills import execute_skill
         result = execute_skill(inp.get("skill_name", ""), inp.get("args", ""))
 
         if not result:
-            return f"Unknown skill: {inp.get('skill_name', '')}"
+            return ToolResult.error(f"Unknown skill: {inp.get('skill_name', '')}")
 
         #fork 表示这个 skill 不直接把 prompt 塞回当前对话，而是要启动一个子 Agent 单独完成任务。
         if result["context"] == "fork":
@@ -1164,18 +1288,18 @@ class Agent:
             )
 
             print_sub_agent_start("skill-fork", inp.get("skill_name", ""))
-            sub_agent = self._spawn_sub_agent(result["prompt"], tools)
+            sub_agent = self._spawn_sub_agent(result["prompt"], tools, label=f"skill:{inp.get('skill_name', '')}")
             try:
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
                 self.total_input_tokens += sub_result["tokens"]["input"]
                 self.total_output_tokens += sub_result["tokens"]["output"]
                 print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
-                return sub_result["text"] or "(Skill produced no output)"
+                return ToolResult.ok(sub_result["text"] or "(Skill produced no output)")
             except Exception as e:
                 print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
-                return f"Skill fork error: {e}"
+                return ToolResult.error(f"Skill fork error: {e}")
 
-        return f'[Skill "{inp.get("skill_name", "")}" activated]\n\n{result["prompt"]}'
+        return ToolResult.ok(f'[Skill "{inp.get("skill_name", "")}" activated]\n\n{result["prompt"]}')
 
     async def _execute_plan_mode_tool(self, name):
         if name == "enter_plan_mode":
@@ -1265,12 +1389,13 @@ class Agent:
             await asyncio.gather(*pending, return_exceptions=True)
         self._inflight_tool_tasks.clear()
 
-    def _spawn_sub_agent(self, system_prompt: str, tools: list[ToolDef]) -> "Agent":
+    def _spawn_sub_agent(self, system_prompt: str, tools: list[ToolDef], *, label: str = "sub") -> "Agent":
         """
         派生子 agent 的唯一入口。
         - 连接配置（协议、地址、密钥、模型）原样继承，否则子 agent 会连到 SDK 默认地址。
         - 权限模式继承父 agent：派出去的 agent 不能比派它的 agent 权限更大。
         - 共用确认函数和已确认集合，主 agent 批过的操作不重复询问。
+        - 共用 recorder：事件串到派它出去的那次工具调用上，费用实时计入同一个 --max-cost。
         """
         sub_agent = Agent(
             model=self.model,
@@ -1282,11 +1407,15 @@ class Agent:
             is_sub_agent=True,
             permission_mode=self.permission_mode,
             confirm_fn=self.confirm_fn,
+            max_cost_usd=self.max_cost_usd,
+            recorder=self._recorder,
+            trace_parent={"trace_id": self._trace_id, "parent_span_id": self._current_span_id,
+                          "label": label},
         )
         sub_agent._confirmed_paths = self._confirmed_paths
         return sub_agent
 
-    async def _execute_agent_tool(self, inp:dict) -> str:
+    async def _execute_agent_tool(self, inp:dict) -> ToolResult:
         agent_type = inp.get("type", "general")
         description = inp.get("description", "sub-agent task")
         prompt = inp.get("prompt", "")
@@ -1294,16 +1423,16 @@ class Agent:
 
         config = get_sub_agent_config(agent_type)
 
-        sub_agent = self._spawn_sub_agent(config["system_prompt"], config["tools"])
+        sub_agent = self._spawn_sub_agent(config["system_prompt"], config["tools"], label=f"sub:{agent_type}")
         try:
             result = await sub_agent.run_once(prompt)
             self.total_input_tokens += result["tokens"]["input"]
             self.total_output_tokens += result["tokens"]["output"]
             print_sub_agent_end(agent_type, description)
-            return result["text"] or "(Sub-agent produced no output)"
+            return ToolResult.ok(result["text"] or "(Sub-agent produced no output)")
         except Exception as e:
             print_sub_agent_end(agent_type, description)
-            return f"Sub-agent error: {e}"
+            return ToolResult.error(f"Sub-agent error: {e}")
 
 #--------------Anthropic 后端---------------
     async def  _chat_anthropic(self, user_message: str) -> None:
@@ -1370,28 +1499,34 @@ class Agent:
             early_executions: dict[str, asyncio.Task] = {}
 
 
+            early_spans: dict[str, str] = {}
+
             def _on_tool_block(block:dict):
                 # 流式响应中一旦完整收到 tool_use block，如果工具是并发安全且权限允许，
                 # 就可以提前开始执行，减少等待完整模型响应后的空档时间。
                 if block["name"] in CONCURRENCY_SAFE_TOOLS:
                     perm = check_permission(block["name"], block["input"], self.permission_mode, self._plan_file_path)
                     if perm["action"]=="allow":
-                        task =asyncio.create_task(self._execute_tool_call(block["name"], block["input"]))
+                        span_id = new_id()
+                        self._recorder.record_permission(tool=block["name"], decision="allow", early=True,
+                                                         **self._trace_fields(span_id))
+                        task =asyncio.create_task(self._timed_tool_call(block["name"], block["input"], span_id))
                         early_executions[block["id"]] = task
+                        early_spans[block["id"]] = span_id
                         self._inflight_tool_tasks.add(task)
                         task.add_done_callback(self._inflight_tool_tasks.discard)
 
 
             # 调用 Anthropic 流式接口；流式过程中完成 tool block 时会触发 _on_tool_block。
+            started = time.monotonic()
+            self._call_retries = 0
             response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
             if not self.is_sub_agent:
                 stop_spinner()
 
-            # 记录本次模型调用的耗时点和 token 消耗，用于成本展示与预算控制。
-            self.last_api_call_time = time.time()
-            self.total_input_tokens += response.usage.input_tokens
-            self.total_output_tokens += response.usage.output_tokens
-            self.last_input_token_count = response.usage.input_tokens
+            # 记录本次模型调用的耗时、token、缓存命中和费用，用于成本展示与预算控制。
+            self._record_model_call(self._anthropic_usage(response.usage), started=started,
+                                    stop_reason=getattr(response, "stop_reason", None))
 
             # Anthropic 的响应内容里可能混有 text block 和 tool_use block，这里只挑出工具调用。
             tool_uses = [b for b in response.content if b.type == "tool_use"]
@@ -1405,7 +1540,7 @@ class Agent:
             # 没有工具调用，说明模型已经给出最终回复，本轮对话结束。
             if not tool_uses:
                 if not self.is_sub_agent:
-                    print_cost(self.total_input_tokens, self.total_output_tokens)
+                    print_cost(self.total_input_tokens, self.total_output_tokens, self._format_cost())
                 break
 
             # 有工具调用时，进入下一轮工具执行。这里同时检查 turn/budget 限制。
@@ -1416,11 +1551,7 @@ class Agent:
                 self._anthropic_messages.append({
                     "role": "user",
                     "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tu.id,
-                            "content": f"Tool execution skipped: {budget['reason']}",
-                        }
+                        self._anthropic_tool_result(tu.id, ToolResult.error(f"Tool execution skipped: {budget['reason']}"))
                         for tu in tool_uses
                     ],
                 })
@@ -1443,58 +1574,32 @@ class Agent:
                 # 如果这个工具已经在流式阶段提前开始执行，这里只需要等待它完成并收集结果。
                 early_task = early_executions.get(tu.id)
                 if early_task:
-                    try:
-                        raw = await early_task
-                    except Exception as e:
-                        raw = f"Error executing tool: {e}"
-                    raw = _safe_utf8_text(raw)
-                    res = self._persist_large_result(tu.name, raw)
-                    print_tool_result(tu.name, res)
-                    self._record_tool_outcome(tu.name, not self._looks_like_tool_failure(tu.name, raw, res))
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
+                    span_id = early_spans[tu.id]
+                    result = self._finish_tool_call(tu.name, inp, await early_task, span_id=span_id, early=True)
+                    tool_results.append(self._anthropic_tool_result(tu.id, result))
                     continue
 
-                # 如果不是提前执行的工具，就在真正执行前做权限检查。
-
-                perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
-                if perm["action"] == "deny":
-                    # 权限拒绝时，也要返回一个 tool_result，让模型知道该工具调用失败的原因。
-                    print_info(f"Denied: {perm.get('message', '')}")
-                    self._record_tool_outcome(tu.name, False)
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
-                                         "content": f"Action denied: {perm.get('message', '')}"})
+                # 如果不是提前执行的工具，就在真正执行前做权限检查（拒绝时也要回一个 tool_result）。
+                span_id = new_id()
+                denial = await self._authorize_tool(tu.name, inp, span_id)
+                if denial is not None:
+                    tool_results.append(self._anthropic_tool_result(tu.id, denial))
                     continue
-
-                if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
-                    # 高风险操作需要用户确认；同一个 message 确认过后会缓存，避免重复询问。
-                    confirmed = await self._confirm_dangerous(perm["message"])
-                    if not confirmed:
-                        self._record_tool_outcome(tu.name, False)
-                        tool_results.append(
-                            {"type": "tool_result", "tool_use_id": tu.id, "content": "User denied this action."})
-                        continue
-                    self._confirmed_paths.add(perm["message"])
 
                 # 权限通过后执行工具，并把大输出持久化为可回传的摘要或引用。
-                try:
-                    raw = await self._execute_tool_call(tu.name, inp)
-                except Exception as e:
-                    raw = f"Error executing tool: {e}"
-                raw = _safe_utf8_text(raw)
-                res = self._persist_large_result(tu.name, raw)
-                print_tool_result(tu.name, res)
-                self._record_tool_outcome(tu.name, not self._looks_like_tool_failure(tu.name, raw, res))
+                result = await self._timed_tool_call(tu.name, inp, span_id)
+                result = self._finish_tool_call(tu.name, inp, result, span_id=span_id)
 
                 if self._context_cleared:
                     # 工具执行过程中如果清理了上下文，就把结果作为新的用户消息写入，
                     # 并停止继续处理本轮剩余工具，避免旧上下文和新上下文混在一起。
                     self._context_cleared = False
-                    self._anthropic_messages.append({"role": "user", "content": res})
+                    self._anthropic_messages.append({"role": "user", "content": result.content})
                     context_break = True
                     break
 
                 # Anthropic 要求 tool_result 使用 tool_use_id 对应到前面的 tool_use block。
-                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
+                tool_results.append(self._anthropic_tool_result(tu.id, result))
 
             if not context_break and tool_results:
                 # Anthropic 要求 assistant/tool_use 后面紧跟一条 user/tool_result 消息，
@@ -1534,6 +1639,7 @@ class Agent:
                 create_params["thinking"]={"type": "enabled", "budget_tokens": max_output - 1}
 
             first_text = True
+            self._call_first_token_at = None
 
             tool_blocks_by_index: dict[int, dict] = {}
 
@@ -1541,6 +1647,8 @@ class Agent:
                 async for event in stream:
                     if not hasattr(event, 'type'):
                         continue
+                    if self._call_first_token_at is None and event.type in ("content_block_start", "content_block_delta"):
+                        self._call_first_token_at = time.monotonic()
                     # 当事件是工具调用开始：
                     if event.type == "content_block_start":
                         cb = getattr(event, 'content_block', None)
@@ -1599,11 +1707,13 @@ class Agent:
             final_message.content = [b for b in final_message.content if b.type != "thinking"]
             return final_message
 #调用 _do()，如果遇到可重试错误，就由 _with_retry() 负责重试。
-        return await _with_retry(_do)
+        return await _with_retry(_do, on_retry=self._note_retry)
 
     #openAI后端
 
     async def _chat_openai(self, user_message:str) -> None:
+        # 上一轮被 Ctrl+C 打断时可能留下没有结果的 tool_call，先补齐。
+        self._openai_messages = self._normalize_openai_messages(self._openai_messages)
         user_message = _safe_utf8_text(user_message)
         self._openai_messages.append({"role": "user", "content": user_message})
 
@@ -1646,19 +1756,23 @@ class Agent:
             if not self.is_sub_agent:
                 start_spinner()
 
+            started = time.monotonic()
+            self._call_retries = 0
             response = await self._call_openai_stream()
 
             if not self.is_sub_agent:
                 stop_spinner()
 
-            self.last_api_call_time = time.time()
-
-            if response.get("usage"):
-                self.total_input_tokens += response["usage"]["prompt_tokens"]
-                self.total_output_tokens += response["usage"]["completion_tokens"]
-                self.last_input_token_count = response["usage"]["prompt_tokens"]
-
             choice = response.get("choices", [{}])[0] if response.get("choices") else {}
+            if response.get("usage"):
+                u = response["usage"]
+                cached = u.get("cached_tokens", 0) or 0
+                self._record_model_call(
+                    {"input": max(u["prompt_tokens"] - cached, 0), "output": u["completion_tokens"],
+                     "cache_read": cached, "cache_write": 0},
+                    started=started, stop_reason=choice.get("finish_reason"),
+                )
+
             message = choice.get("message", {})
 
             self._openai_messages.append(message)
@@ -1667,15 +1781,20 @@ class Agent:
 
             if not tool_calls:
                 if not self.is_sub_agent:
-                    print_cost(self.total_input_tokens, self.total_output_tokens)
+                    print_cost(self.total_input_tokens, self.total_output_tokens, self._format_cost())
                 break
 
             self.current_turns += 1
             budget = self._check_budget()
             if budget["exceeded"]:
                 print_info(f"Budget exceeded: {budget['reason']}")
+                # OpenAI 要求每个 tool_call 都有对应的 tool 消息，否则下一次请求会被拒绝。
+                for tc in tool_calls:
+                    self._openai_messages.append(self._openai_tool_message(
+                        tc["id"], ToolResult.error(f"Tool execution skipped: {budget['reason']}")))
                 break
 
+            # 1) 先对所有工具调用逐个做权限判定（每个调用只判定一次）。
             oai_checked: list[dict] = []
             for tc in tool_calls:
                 if self._aborted:
@@ -1691,78 +1810,53 @@ class Agent:
                     inp = {}
 
                 print_tool_call(fn_name, inp)
+                span_id = new_id()
+                denial = await self._authorize_tool(fn_name, inp, span_id)
+                oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "span": span_id, "denial": denial})
 
-                perm = check_permission(fn_name, inp, self.permission_mode, self._plan_file_path)
+            # 2) 相邻的、已放行的只读工具合成一批并发执行，其余按顺序执行。
+            #    （原实现把这段写在上面的循环里，多个工具调用时会把前面的调用重复执行。）
+            oai_batches: list[dict] = []
+            for ct in oai_checked:
+                safe = ct["denial"] is None and ct["fn"] in CONCURRENCY_SAFE_TOOLS
+                if safe and oai_batches and oai_batches[-1]["concurrent"]:
+                    oai_batches[-1]["items"].append(ct)
+                else:
+                    oai_batches.append({"concurrent": safe, "items": [ct]})
 
-                if perm["action"] == "deny":
-                    print_info(f"Denied: {perm.get('message', '')}")
-                    self._record_tool_outcome(fn_name, False)
-                    oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False,
-                                        "result": f"Action denied: {perm.get('message', '')}"})
+            oai_context_break = False
+            for batch in oai_batches:
+                if oai_context_break or self._aborted:
+                    break
+
+                if batch["concurrent"]:
+                    # _timed_tool_call 不抛异常（取消除外），一个工具出错不会拖垮同批的其他工具。
+                    results = await asyncio.gather(
+                        *[self._timed_tool_call(ct["fn"], ct["inp"], ct["span"]) for ct in batch["items"]])
+                    for ct, res in zip(batch["items"], results):
+                        res = self._finish_tool_call(ct["fn"], ct["inp"], res, span_id=ct["span"])
+                        self._openai_messages.append(self._openai_tool_message(ct["tc"]["id"], res))
                     continue
-                if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
-                    confirmed = await self._confirm_dangerous(perm["message"])
-                    if not confirmed:
-                        self._record_tool_outcome(fn_name, False)
-                        oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False,
-                                            "result": "User denied this action."})
+
+                for ct in batch["items"]:
+                    if ct["denial"] is not None:
+                        self._openai_messages.append(self._openai_tool_message(ct["tc"]["id"], ct["denial"]))
                         continue
-                    self._confirmed_paths.add(perm["message"])
-                oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
 
-                oai_batches: list[dict] = []
-                for ct in oai_checked:
-                    safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
-                    if safe and oai_batches and oai_batches[-1]["concurrent"]:
-                        oai_batches[-1]["items"].append(ct)
-                    else:
-                        oai_batches.append({"concurrent": safe, "items": [ct]})
+                    res = await self._timed_tool_call(ct["fn"], ct["inp"], ct["span"])
+                    res = self._finish_tool_call(ct["fn"], ct["inp"], res, span_id=ct["span"])
 
-                oai_context_break = False
-                for batch in oai_batches:
-                    if oai_context_break or self._aborted:
+                    if self._context_cleared:
+                        self._context_cleared = False
+                        self._openai_messages.append({"role": "user", "content": res.content})
+                        oai_context_break = True
                         break
 
-                    if batch["concurrent"]:
-                        async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
-                            raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
-                            raw = _safe_utf8_text(raw)
-                            res = self._persist_large_result(ct_item["fn"], raw)
-                            print_tool_result(ct_item["fn"], res)
-                            return ct_item, res
+                    self._openai_messages.append(self._openai_tool_message(ct["tc"]["id"], res))
 
-                        results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
-                        for ct_item, res in results:
-                            self._record_tool_outcome(
-                                ct_item["fn"],
-                                not self._looks_like_tool_failure(ct_item["fn"], "", res),
-                            )
-                            self._openai_messages.append(
-                                {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
-                    else:
-                        for ct in batch["items"]:
-                            if not ct["allowed"]:
-                                self._openai_messages.append(
-                                    {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
-                                continue
-
-                            raw = await self._execute_tool_call(ct["fn"], ct["inp"])
-                            raw = _safe_utf8_text(raw)
-                            res = self._persist_large_result(ct["fn"], raw)
-                            print_tool_result(ct["fn"], res)
-                            self._record_tool_outcome(
-                                ct["fn"],
-                                not self._looks_like_tool_failure(ct["fn"], raw, res),
-                            )
-
-                            if self._context_cleared:
-                                self._context_cleared = False
-                                self._openai_messages.append({"role": "user", "content": res})
-                                oai_context_break = True
-                                break
-
-                            self._openai_messages.append(
-                                {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
+            # 3) 中断等情况下没拿到结果的调用补一条错误结果，保证消息完整。
+            if not oai_context_break:
+                self._openai_messages = self._normalize_openai_messages(self._openai_messages)
 
             self._context_cleared = False
             self._refresh_runtime_system_prompt()
@@ -1783,17 +1877,25 @@ class Agent:
             tool_calls: dict[int, dict] = {}
             finish_reason = ""
             usage = None
+            self._call_first_token_at = None
 
             async for chunk in stream:
                 if chunk.usage:
+                    # 缓存命中：OpenAI 在 prompt_tokens_details.cached_tokens，DeepSeek 在 prompt_cache_hit_tokens。
+                    details = getattr(chunk.usage, "prompt_tokens_details", None)
+                    cached = (getattr(details, "cached_tokens", 0) if details else 0) \
+                        or getattr(chunk.usage, "prompt_cache_hit_tokens", 0) or 0
                     usage = {
-                        "prompt_tokens": chunk.usage.prompt_tokens,
-                        "completion_tokens": chunk.usage.completion_tokens,
+                        "prompt_tokens": chunk.usage.prompt_tokens or 0,
+                        "completion_tokens": chunk.usage.completion_tokens or 0,
+                        "cached_tokens": cached,
                     }
 
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
+                if self._call_first_token_at is None and delta and (delta.content or delta.tool_calls):
+                    self._call_first_token_at = time.monotonic()
 
                 if delta and delta.content:
                     if first_text:
@@ -1835,10 +1937,63 @@ class Agent:
                     },
                     "finish_reason": finish_reason or "stop",
                 }],
-                "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0},
+                "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0},
             }
 
-        return await _with_retry(_do)
+        return await _with_retry(_do, on_retry=self._note_retry)
+
+    def _note_retry(self) -> None:
+        self._call_retries += 1
+
+    @staticmethod
+    def _anthropic_usage(u: Any) -> dict[str, int]:
+        # Anthropic 的 input_tokens 不含缓存读写部分，三者相加才是这次请求的完整提示词大小。
+        return {
+            "input": getattr(u, "input_tokens", 0) or 0,
+            "output": getattr(u, "output_tokens", 0) or 0,
+            "cache_read": getattr(u, "cache_read_input_tokens", 0) or 0,
+            "cache_write": getattr(u, "cache_creation_input_tokens", 0) or 0,
+        }
+
+    def _record_model_call(self, usage: dict[str, int], *, started: float, stop_reason: str | None) -> None:
+        """更新 token 统计、按本次调用的模型价格计费，并写 model_call 事件。"""
+        prompt_total = usage["input"] + usage["cache_read"] + usage["cache_write"]
+        self.last_api_call_time = time.time()
+        self.total_input_tokens += prompt_total
+        self.total_output_tokens += usage["output"]
+        self.last_input_token_count = prompt_total
+        cost = call_cost_usd(self.model, input_tokens=usage["input"], output_tokens=usage["output"],
+                             cache_read_tokens=usage["cache_read"], cache_write_tokens=usage["cache_write"])
+        ttft = (self._call_first_token_at - started) * 1000 if self._call_first_token_at else None
+        self._recorder.record_model_call(
+            cost_usd=cost, latency_ms=(time.monotonic() - started) * 1000, ttft_ms=ttft,
+            retries=self._call_retries, cache_read=usage["cache_read"], cache_write=usage["cache_write"],
+            model=self.model, input_tokens=usage["input"], output_tokens=usage["output"],
+            stop_reason=stop_reason, **self._trace_fields(),
+        )
+
+    @staticmethod
+    def _normalize_openai_messages(messages: list) -> list:
+        """给没有结果的 tool_call 补一条错误结果：中断或出错后，下一次请求不会因消息不完整被拒绝。"""
+        out: list = []
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            out.append(msg)
+            i += 1
+            calls = msg.get("tool_calls") if isinstance(msg, dict) and msg.get("role") == "assistant" else None
+            if not calls:
+                continue
+            answered = set()
+            while i < len(messages) and isinstance(messages[i], dict) and messages[i].get("role") == "tool":
+                answered.add(messages[i].get("tool_call_id"))
+                out.append(messages[i])
+                i += 1
+            for call in calls:
+                if call.get("id") not in answered:
+                    out.append({"role": "tool", "tool_call_id": call.get("id"),
+                                "content": "[tool error] Tool execution was interrupted before it produced a result."})
+        return out
 
     async def _confirm_dangerous(self, command: str) -> bool:
         print_confirmation(command)

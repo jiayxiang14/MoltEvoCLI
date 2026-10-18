@@ -15,6 +15,7 @@ from pathlib import Path
 from tqdm.utils import IS_WIN
 
 from agents.memory import get_memory_dir
+from agents.tool_result import ToolResult
 
 ToolDef = dict  # Anthropic tool schema dict
 #权限模式
@@ -252,17 +253,17 @@ def _resolve_tool_path(raw_path: str, *, must_exist: bool = True) -> Path:
 
 
 #读取文件并且在读取文件的基础上添加行号
-def _read_file(inp:dict) -> str:
+def _read_file(inp:dict) -> ToolResult:
     try:
         path = _resolve_tool_path(inp["file_path"])
         content = path.read_text(errors="replace")
         lines = content.split("\n")
         numbered = "\n".join(f"{i + 1:4d} | {line}" for i, line in enumerate(lines))
-        return numbered
+        return ToolResult.ok(numbered)
     except Exception as e:
-        return f"Error reading file: {e}"
+        return ToolResult.error(f"Error reading file: {e}")
 
-def _write_file(inp:dict) -> str:
+def _write_file(inp:dict) -> ToolResult:
     try:
         path = _resolve_tool_path(inp["file_path"], must_exist=False)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -272,9 +273,9 @@ def _write_file(inp:dict) -> str:
         line_count = len(lines)
         preview = "\n".join(f"{i + 1:4d} | {l}" for i, l in enumerate(lines[:30]))
         trunc = f"\n  ... ({line_count} lines total)" if line_count > 30 else ""
-        return f"Successfully wrote to {inp['file_path']} ({line_count} lines)\n\n{preview}{trunc}"
+        return ToolResult.ok(f"Successfully wrote to {inp['file_path']} ({line_count} lines)\n\n{preview}{trunc}")
     except Exception as e:
-        return f"Error writing file: {e}"
+        return ToolResult.error(f"Error writing file: {e}")
 
 def _auto_update_memory_index(file_path:str) -> None:
     try:
@@ -335,18 +336,18 @@ def _generate_diff(old_content: str, old_string: str, new_string: str) -> str:
     return "\n".join(parts)
 
 #编辑文件
-def _edit_file(inp: dict) -> str:
+def _edit_file(inp: dict) -> ToolResult:
     try:
         path = _resolve_tool_path(inp["file_path"])
         content = path.read_text(errors="replace")
 
         actual = _find_actual_string(content, inp["old_string"])
         if not actual:
-            return f"Error: old_string not found in {inp['file_path']}"
+            return ToolResult.error(f"Error: old_string not found in {inp['file_path']}")
 
         occurrences = content.count(inp["old_string"])
         if occurrences > 1:
-            return f"Error: old_string found {occurrences} times in {inp['file_path']}. Must be unique."
+            return ToolResult.error(f"Error: old_string found {occurrences} times in {inp['file_path']}. Must be unique.")
 
         new_content = content.replace(actual, inp["new_string"], 1)
         path.write_text(new_content)
@@ -355,12 +356,12 @@ def _edit_file(inp: dict) -> str:
 
         quote_note = " (matched via quote normalization)" if actual != inp["old_string"] else ""
 
-        return f"Successfully edited {inp['file_path']}{quote_note}\n\n{diff}"
+        return ToolResult.ok(f"Successfully edited {inp['file_path']}{quote_note}\n\n{diff}")
     except Exception as e:
-        return f"Error editing file: {e}"
+        return ToolResult.error(f"Error editing file: {e}")
 
 
-def _list_files(inp: dict) -> str:
+def _list_files(inp: dict) -> ToolResult:
     try:
         base = _resolve_tool_path(inp.get("path") or ".")
         pattern = inp["pattern"]
@@ -375,14 +376,14 @@ def _list_files(inp: dict) -> str:
                 if len(files) >= 200:
                     break
         if not files:
-            return "No files found matching the pattern."
+            return ToolResult.ok("No files found matching the pattern.")
         result = "\n".join(files[:200])
 
         if len(files) > 200:
             result += f"\n...and {len(files) - 200} more files are found ..."
-        return result
+        return ToolResult.ok(result)
     except Exception as e:
-        return f"Error listing files: {e}"
+        return ToolResult.error(f"Error listing files: {e}")
 
 
 #--------子进程执行：shell 和 grep 共用，不阻塞事件循环---------------------
@@ -500,7 +501,7 @@ def _format_grep_lines(lines: list[str]) -> str:
     return output
 
 
-async def _grep_search(inp: dict) -> str:
+async def _grep_search(inp: dict) -> ToolResult:
     pattern = inp["pattern"]
     path = str(_resolve_tool_path(inp.get("path") or "."))
     include = inp.get("include")
@@ -519,22 +520,23 @@ async def _grep_search(inp: dict) -> str:
         if timed_out:
             # 超时直接返回部分结果，不再退回 Python 全量重扫（那样更慢）。
             note = f"[grep timed out after {GREP_TIMEOUT_S}s; results are partial. Narrow the path or use include.]"
-            return f"{_format_grep_lines(lines)}\n{note}" if lines else f"No matches found before timeout. {note}"
+            text = f"{_format_grep_lines(lines)}\n{note}" if lines else f"No matches found before timeout. {note}"
+            return ToolResult.ok(text, timed_out=True)
         if returncode == 1:
-            return "No matches found."
+            return ToolResult.ok("No matches found.")
         if returncode == 0 or (returncode == 2 and lines):
             # 退出码 2 且有结果：通常是个别文件无权限读取，结果仍然可用。
-            return _format_grep_lines(lines)
+            return ToolResult.ok(_format_grep_lines(lines))
 
     # 没有 grep（如 Windows）或 grep 不接受这个模式：用 Python 实现，放进线程并设截止时间。
     return await asyncio.to_thread(_grep_python, pattern, path, include)
 
 
-def _grep_python(pattern: str, directory: str, include: str | None) -> str:
+def _grep_python(pattern: str, directory: str, include: str | None) -> ToolResult:
     try:
         regex = re.compile(pattern)
     except re.error as e:
-        return f"Error: invalid regex pattern: {e}"
+        return ToolResult.error(f"Error: invalid regex pattern: {e}")
     include_pattern = include
     matches: list[str] = []
     deadline = time.monotonic() + GREP_TIMEOUT_S
@@ -579,8 +581,8 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
     walk(directory)
     note = f"\n[search timed out after {GREP_TIMEOUT_S}s; results are partial. Narrow the path or use include.]" if timed_out else ""
     if not matches:
-        return "No matches found." + note
-    return _format_grep_lines(matches) + note
+        return ToolResult.ok("No matches found." + note, timed_out=timed_out)
+    return ToolResult.ok(_format_grep_lines(matches) + note, timed_out=timed_out)
 
 
 
@@ -634,24 +636,26 @@ def _parse_timeout_ms(raw: object) -> float:
     return min(max(value, 1000), SHELL_MAX_TIMEOUT_MS)
 
 
-async def _run_shell(inp: dict) -> str:
+async def _run_shell(inp: dict) -> ToolResult:
     timeout_ms = _parse_timeout_ms(inp.get("timeout", SHELL_DEFAULT_TIMEOUT_MS))
     try:
         returncode, stdout, stderr, timed_out = await _run_process(
             inp["command"], shell=True, timeout_s=timeout_ms / 1000
         )
     except Exception as e:
-        return f"Error: {e}"
+        return ToolResult.error(f"Error: {e}")
     stdout_part = f"\nStdout: {stdout}" if stdout else ""
     stderr_part = f"\nStderr: {stderr}" if stderr else ""
     if timed_out:
-        return (
+        return ToolResult.error(
             f"Command timed out after {int(timeout_ms)}ms; the process group was terminated."
-            f" Output before timeout:{stdout_part or ' (none)'}{stderr_part}"
+            f" Output before timeout:{stdout_part or ' (none)'}{stderr_part}",
+            exit_code=returncode, timed_out=True,
         )
     if returncode != 0:
-        return f"Command failed (exit code {returncode}){stdout_part}{stderr_part}"
-    return stdout or "(no output)"
+        return ToolResult.error(f"Command failed (exit code {returncode}){stdout_part}{stderr_part}",
+                                exit_code=returncode)
+    return ToolResult.ok(stdout or "(no output)", exit_code=0)
 
 
 #危险命令检测模式列表
@@ -820,32 +824,38 @@ def check_permission(
 
 
 
+def _skill_op_result(result: dict) -> ToolResult:
+    text = _truncate_result(json.dumps(result, ensure_ascii=False, indent=2))
+    return ToolResult.ok(text) if result.get("ok") else ToolResult.error(text)
+
+
 #----------------执行工具调用-----------------------
 # 'agent' 和 'skill' 这两个工具在 agent.py 中处理，以避免循环依赖。"
 
 async def execute_tool(
     name: str, inp: dict, read_file_state: dict[str, float] | None = None
-) -> str:
+) -> ToolResult:
     if name == "read_file":
         # 读大文件可能耗时，放进线程，不阻塞事件循环；读写共享状态的代码留在主线程。
         result = await asyncio.to_thread(_read_file, inp)
-        if read_file_state is not None and not result.startswith("Error"):
+        if read_file_state is not None and not result.is_error:
             abs_path = str(_resolve_tool_path(inp["file_path"]).resolve())
             try:
                 read_file_state[abs_path] =  os.path.getmtime(abs_path)
             except OSError:
                 pass
-        return _truncate_result(result)
+        result.content = _truncate_result(result.content)
+        return result
 
     if name in ("write_file", "edit_file") and read_file_state is not None:
         abs_path = str(_resolve_tool_path(inp["file_path"], must_exist=(name == "edit_file")).resolve())
         if os.path.exists(abs_path):
             if abs_path not in read_file_state:
                 verb = "writing" if name == "write_file" else "editing"
-                return f"Error: You must read this file before {verb}. Use read_file first to see its current contents."
+                return ToolResult.error(f"Error: You must read this file before {verb}. Use read_file first to see its current contents.")
             if os.path.getmtime(abs_path) != read_file_state[abs_path]:
                 verb = "writing" if name == "write_file" else "editing"
-                return f"Warning: {inp['file_path']} was modified externally since your last read. Please read_file again before {verb}."
+                return ToolResult.error(f"Warning: {inp['file_path']} was modified externally since your last read. Please read_file again before {verb}.")
 
     #搜索和激活延迟加载的工具。
     if name == "tool_search":
@@ -856,16 +866,16 @@ async def execute_tool(
             if query in t["name"].lower() or query in (t.get("description") or "").lower()
         ]
         if not matches:
-            return "No matching deferred tools found."
+            return ToolResult.ok("No matching deferred tools found.")
 
         for m in matches:
             _activated_tools.add(m["name"])
 
-        return json.dumps(
+        return ToolResult.ok(json.dumps(
             [{"name": t["name"], "description": t.get("description", ""), "input_schema": t["input_schema"]} for t in
              matches],
             indent=2,
-        )
+        ))
     if name == "skill_evolve":
         from .skills import evolve_skill
 
@@ -875,7 +885,7 @@ async def execute_tool(
             rationale=inp.get("rationale", ""),
             target=inp.get("target", "active"),
         )
-        return _truncate_result(json.dumps(result, ensure_ascii=False, indent=2))
+        return _skill_op_result(result)
 
     if name == "skill_create":
         from .skills import create_skill
@@ -891,7 +901,7 @@ async def execute_tool(
             allowed_tools=inp.get("allowed_tools"),
             evidence=inp.get("evidence", ""),
         )
-        return _truncate_result(json.dumps(result, ensure_ascii=False, indent=2))
+        return _skill_op_result(result)
 
     if name == "run_shell":
         result = await _run_shell(inp)
@@ -904,11 +914,11 @@ async def execute_tool(
         # 写操作留在主线程同步执行：很快，而且被取消时不会出现"线程里写完了、模型却不知道"的情况。
         result = (_write_file if name == "write_file" else _edit_file)(inp)
     else:
-        return f"Unknown tool: {name}"
-    result = _truncate_result(result)
+        return ToolResult.error(f"Unknown tool: {name}")
+    result.content = _truncate_result(result.content)
 
     # 更新时间
-    if name in ("write_file", "edit_file") and read_file_state is not None and not result.startswith("Error"):
+    if name in ("write_file", "edit_file") and read_file_state is not None and not result.is_error:
         abs_path = str(_resolve_tool_path(inp["file_path"], must_exist=False).resolve())
         try:
             read_file_state[abs_path] = os.path.getmtime(abs_path)

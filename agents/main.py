@@ -24,6 +24,7 @@ from .ui import (
     print_memory_entries,
     print_skill_entries,
     print_warning,
+    print_stats,
     mark_line_start,
 )
 from .session import load_session, get_latest_session_id
@@ -219,6 +220,9 @@ async def run_repl(agent: Agent) -> None:
         if inp == "/cost":
             agent.show_cost()
             continue
+        if inp == "/stats":
+            print_stats(agent.get_run_stats())
+            continue
         if inp == "/compact":
             try:
                 await agent.compact()
@@ -362,6 +366,7 @@ REPL commands:
   /clear              Clear conversation history
   /plan               Toggle plan mode (read-only <-> normal)
   /cost               Show token usage and cost
+  /stats              Show tool calls, failure rate, latency and cost for this session
   /compact            Manually compact conversation
   /memory             List saved memories
   /skills             List available skills
