@@ -47,22 +47,38 @@ def load_session(session_id: str) -> dict[str, Any] | None:
         return None
 
 
-def list_sessions() -> list[dict[str, Any]]:
+def list_sessions(cwd: str | None = None) -> list[dict[str, Any]]:
+    """列出会话元数据。传入 cwd 时只返回在该目录下创建的会话（所有项目的会话存放在同一个目录里）。"""
     _ensure_dir()
     results = []
     for f in SESSION_DIR.glob("*.json"):
         try:
             data = json.loads(f.read_text())
-            if "metadata" in data:
-                results.append(data["metadata"])
+            meta = data.get("metadata")
+            if meta and (cwd is None or meta.get("cwd") == cwd):
+                results.append(meta)
         except Exception:
             pass
     return results
 
 
-def get_latest_session_id() -> str | None:
-    sessions = list_sessions()
+def get_latest_session_id(cwd: str | None = None) -> str | None:
+    sessions = list_sessions(cwd)
     if not sessions:
         return None
-    sessions.sort(key=lambda s: s.get("startTime", ""), reverse=True)
+    # 同一时刻开始的会话按保存时间排序（同一会话的多次保存会更新文件修改时间）。
+    sessions.sort(key=lambda s: (s.get("startTime", ""), _mtime(s.get("id"))), reverse=True)
     return sessions[0].get("id")
+
+
+def find_session_id(prefix: str, cwd: str | None = None) -> str | None:
+    """按会话 ID 前缀查找；有歧义或找不到返回 None。"""
+    matches = [s.get("id") for s in list_sessions(cwd) if str(s.get("id", "")).startswith(prefix)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _mtime(session_id: str | None) -> float:
+    try:
+        return (SESSION_DIR / f"{session_id}.json").stat().st_mtime
+    except OSError:
+        return 0.0

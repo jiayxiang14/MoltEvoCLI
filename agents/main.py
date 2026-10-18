@@ -25,9 +25,10 @@ from .ui import (
     print_skill_entries,
     print_warning,
     print_stats,
+    print_checkpoints,
     mark_line_start,
 )
-from .session import load_session, get_latest_session_id
+from .session import load_session, get_latest_session_id, find_session_id
 from .memory import list_memories
 from .skills import (
     create_skill,
@@ -58,7 +59,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--thinking", action="store_true", help="Enable extended thinking")
     parser.add_argument("--model", "-m", default=None, help="Model to use")
     parser.add_argument("--api-base", default=None, help="OpenAI-compatible API base URL")
-    parser.add_argument("--resume", action="store_true", help="Resume last session")
+    parser.add_argument("--resume", nargs="?", const="latest", default=None, metavar="SESSION_ID",
+                        help="Resume the latest session in this project, or the given session id")
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
     parser.add_argument("--verify", default=None,
@@ -141,6 +143,39 @@ def _resolve_api_config(cli_api_base: str | None) -> tuple[str | None, str | Non
         return None, generic_api_key, False
 
     return None, None, False
+
+
+_REWIND_MODES = {"b": "both", "both": "both", "c": "conversation", "conversation": "conversation",
+                 "f": "code", "files": "code", "code": "code"}
+
+
+def _handle_rewind(agent: Agent, args: list[str]) -> None:
+    """/rewind：不带参数时列出检查点并交互选择；/rewind N [both|conversation|code] [--force] 直接执行。"""
+    force = "--force" in args
+    args = [a for a in args if a != "--force"]
+    checkpoints = agent.list_checkpoints()
+    if not checkpoints:
+        print_info("No checkpoints yet.")
+        return
+    if args:
+        turn_text, mode_text = args[0], (args[1] if len(args) > 1 else "both")
+    else:
+        print_checkpoints(checkpoints[-10:])
+        try:
+            turn_text = input("  Rewind to before turn # (Enter to cancel): ").strip()
+            mark_line_start()
+            if not turn_text:
+                return
+            mode_text = input("  Restore [b]oth / [c]onversation only / [f]iles only: ").strip().lower() or "b"
+            mark_line_start()
+        except EOFError:
+            return
+    mode = _REWIND_MODES.get(mode_text.lower())
+    if not turn_text.isdigit() or mode is None:
+        print_warning("Usage: /rewind [N [both|conversation|code]] [--force]")
+        return
+    ok, message = agent.rewind(int(turn_text), mode, force=force)
+    (print_info if ok else print_warning)(message)
 
 
 async def repl_confirm(message: str, *, preview: str | None = None, offer_all: bool = False) -> str:
@@ -240,6 +275,9 @@ async def run_repl(agent: Agent) -> None:
             continue
         if inp == "/stats":
             print_stats(agent.get_run_stats())
+            continue
+        if inp == "/rewind" or inp.startswith("/rewind "):
+            _handle_rewind(agent, inp[len("/rewind"):].split())
             continue
         if inp == "/undo list":
             edits = agent.list_edits()
@@ -383,7 +421,7 @@ Options:
   --thinking          Enable extended thinking (Anthropic only)
   --model, -m         Model to use (default: deepseek-chat, or MODEL env)
   --api-base URL      Override API base URL from CLI or .env
-  --resume            Resume the last session
+  --resume [ID]       Resume the latest session in this directory, or a specific session id
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
   --verify CMD        Run CMD after a turn that changed files; on failure the agent keeps fixing
@@ -396,6 +434,8 @@ REPL commands:
   /cost               Show token usage and cost
   /stats              Show tool calls, failure rate, latency and cost for this session
   /undo               Revert the agent's last file change (/undo list, /undo --force)
+  /rewind [N [both|conversation|code]] [--force]
+                      Go back to the state before turn N (lists turns when N is omitted)
   /compact            Manually compact conversation
   /memory             List saved memories
   /skills             List available skills
@@ -451,18 +491,19 @@ Examples:
     # Resume session
     # --resume 会加载最近一次会话，把历史消息恢复到新建的 Agent 中。
     if args.resume:
-        session_id = get_latest_session_id()
-        if session_id:
-            session = load_session(session_id)
-            if session:
-                agent.restore_session({
-                    "anthropicMessages": session.get("anthropicMessages"),
-                    "openaiMessages": session.get("openaiMessages"),
-                })
-            else:
-                print_info("No session found to resume.")
+        # 只在当前目录创建的会话里找，避免恢复到别的项目的对话。
+        cwd = os.getcwd()
+        if args.resume == "latest":
+            session_id = get_latest_session_id(cwd)
         else:
-            print_info("No previous sessions found.")
+            session_id = find_session_id(args.resume, cwd)
+        session = load_session(session_id) if session_id else None
+        if session:
+            agent.restore_session(session)
+        elif args.resume == "latest":
+            print_info("No previous sessions found in this directory.")
+        else:
+            print_info(f"No unique session matching '{args.resume}' in this directory.")
 
     # 如果命令行后面带了普通文本参数，就拼成一次性 prompt；否则进入交互式 REPL。
     prompt = " ".join(args.prompt) if args.prompt else None

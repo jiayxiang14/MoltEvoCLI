@@ -47,6 +47,14 @@ class EditHistory:
         self._seq = 0
         # 成功写入的累计次数（撤销不减）。主 agent 用它判断本轮是否改过文件，子 agent 的修改也算在内。
         self.commits = 0
+        # run_shell 的累计执行次数（主 agent 和子 agent 共用）：回退时据此提示"这些轮次跑过 shell，改动无法回退"。
+        self.shell_runs = 0
+
+    def note_shell(self) -> None:
+        self.shell_runs += 1
+
+    def __len__(self) -> int:
+        return len(self._stack)
 
     def before_write(self, path: Path, tool: str) -> EditRecord | None:
         """写入前调用。返回 None 表示文件过大没有存快照，这次修改不能撤销。"""
@@ -78,6 +86,54 @@ class EditHistory:
 
     def records(self) -> list[EditRecord]:
         return list(reversed(self._stack))
+
+    def undo_to(self, length: int, *, force: bool = False) -> tuple[bool, str, list[Path]]:
+        """
+        批量撤销到撤销栈只剩 length 条。先整体检查冲突：每个文件只看它最后一次被改时的哈希，
+        有冲突就一个都不撤（除非 force），避免回退到一半。返回 (是否成功, 说明, 被恢复的路径)。
+        """
+        pending = self._stack[length:]
+        if not pending:
+            return True, "No file changes to revert.", []
+        latest: dict[Path, EditRecord] = {}
+        for record in pending:
+            latest[record.path] = record
+        conflicts = [p for p, r in latest.items()
+                     if (_hash_file(p) if p.exists() else None) != r.after_hash]
+        if conflicts and not force:
+            names = ", ".join(str(p) for p in conflicts)
+            return False, (f"These files changed after the agent wrote them: {names}. "
+                           f"Nothing was reverted; use force to overwrite anyway."), []
+        restored: list[Path] = []
+        while len(self._stack) > length:
+            ok, message, path = self.undo(force=True)
+            if not ok:
+                return False, f"Stopped part-way: {message}", restored
+            if path is not None and path not in restored:
+                restored.append(path)
+        return True, f"Reverted {len(pending)} file change(s) in {len(restored)} file(s).", restored
+
+    # ── 持久化：跟着会话存档一起保存，--resume 之后仍可撤销 ─────────────
+    def to_dict(self) -> dict:
+        return {
+            "seq": self._seq, "commits": self.commits, "shell_runs": self.shell_runs,
+            "records": [{"seq": r.seq, "path": str(r.path), "existed": r.existed,
+                         "snapshot": str(r.snapshot) if r.snapshot else None, "tool": r.tool,
+                         "ts": r.ts, "after_hash": r.after_hash} for r in self._stack],
+        }
+
+    def load_dict(self, data: dict) -> None:
+        self._seq = int(data.get("seq", 0))
+        self.commits = int(data.get("commits", 0))
+        self.shell_runs = int(data.get("shell_runs", 0))
+        self._stack = [
+            EditRecord(int(r["seq"]), Path(r["path"]), bool(r["existed"]),
+                       Path(r["snapshot"]) if r.get("snapshot") else None, r.get("tool", ""),
+                       float(r.get("ts", 0)), r.get("after_hash"))
+            for r in data.get("records", [])
+            # 快照文件已被清理的记录无法撤销，丢弃。
+            if not r.get("existed") or (r.get("snapshot") and Path(r["snapshot"]).exists())
+        ]
 
     def undo(self, *, force: bool = False) -> tuple[bool, str, Path | None]:
         """撤销最近一次修改。返回 (是否成功, 说明, 被恢复的路径)。"""

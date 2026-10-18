@@ -258,6 +258,26 @@ def print_cost(input_tokens: int, output_tokens: int, cost: str) -> None:
     console.print(Panel(table, title="Cost", border_style="cyan", box=box.ROUNDED))
 
 
+def print_checkpoints(checkpoints: list[dict]) -> None:
+    """/rewind 的列表：每轮的开头、之后改过几处文件、是否跑过 shell、对话能否回退。"""
+    _ensure_fresh_line()
+    table = Table(box=box.SIMPLE, show_edge=False, pad_edge=False)
+    table.add_column("turn", style="cyan", justify="right")
+    table.add_column("time", style="dim")
+    table.add_column("prompt")
+    table.add_column("files changed since", justify="right")
+    table.add_column("notes", style="#FFC107")
+    for cp in checkpoints:
+        notes = []
+        if cp["shell_since"]:
+            notes.append("shell ran (not revertible)")
+        if not cp["conversation_rewindable"]:
+            notes.append("code only (compacted)")
+        table.add_row(str(cp["turn"]), time.strftime("%H:%M", time.localtime(cp["ts"])),
+                      _safe_text(cp["preview"]), str(cp["file_changes_since"]), ", ".join(notes))
+    console.print(Panel(table, title="Checkpoints (state before each turn)", border_style="cyan", box=box.ROUNDED))
+
+
 def print_stats(stats: dict) -> None:
     """/stats：本会话（含子 agent）的工具调用、失败率、耗时和费用。"""
     _ensure_fresh_line()

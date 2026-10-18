@@ -191,7 +191,7 @@ class Agent:
         self.current_turns = 0
         self.last_api_call_time = 0
         # 事件日志、汇总统计和累计费用；子 agent 与父 agent 共用同一个 recorder。
-        self._recorder = recorder or RunRecorder(self.session_id, path=events_path)
+        self._recorder = recorder if recorder is not None else RunRecorder(self.session_id, path=events_path)
         trace_parent = trace_parent or {}
         self._trace_id: str | None = trace_parent.get("trace_id")
         self._parent_span_id: str | None = trace_parent.get("parent_span_id")
@@ -201,7 +201,8 @@ class Agent:
         self._call_retries = 0
         self._call_first_token_at: float | None = None
         # 改文件前的快照（/undo）；子 agent 共用，子 agent 的修改同样可以撤销。
-        self._edit_history = edit_history or EditHistory(self.session_id)
+        # 注意用 is not None：EditHistory 定义了 __len__，空栈在布尔判断里为假。
+        self._edit_history = edit_history if edit_history is not None else EditHistory(self.session_id)
         # 下一条用户消息前要附上的系统通知（例如用户撤销了某次修改）。
         self._pending_notices: list[str] = []
         # 完成后验证：本轮改过文件才跑，失败时把输出交还模型，最多重试 MAX_VERIFY_RETRIES 次。
@@ -209,6 +210,11 @@ class Agent:
         self._turn_commit_mark = 0
         self._verify_attempts = 0
         self._verify_failed = False
+        # 检查点：主 agent 每轮开始前记一个，/rewind 据此回退对话和/或代码。
+        # 压缩、/clear 等整体改写历史时 _history_epoch 加一，之前的检查点就不能再回退对话了。
+        self._checkpoints: list[dict[str, Any]] = []
+        self._turn_counter = 0
+        self._history_epoch = 0
         if recorder is None and not is_sub_agent and get_price(model) is None:
             note = "费用将显示为未知" + ("，--max-cost 上限无法生效" if max_cost_usd is not None else "")
             print_warning(f"模型 {model} 不在价格表中，{note}。可在 settings.json 的 pricing 字段补充价格。")
@@ -485,6 +491,8 @@ class Agent:
         self._turn_commit_mark = self._edit_history.commits
         self._verify_attempts = 0
         self._verify_failed = False
+        if not self.is_sub_agent:
+            self._record_checkpoint(original_user_message)
 
         self._aborted = False
         self._turn_output_buffer = []
@@ -634,6 +642,8 @@ class Agent:
     def _finish_tool_call(self, name: str, inp: dict, result: ToolResult, *, span_id: str,
                           early: bool = False) -> ToolResult:
         """截断或落盘 → 打印 → 记录成败 → 写事件。"""
+        if name == "run_shell":
+            self._edit_history.note_shell()
         content = self._persist_large_result(name, _safe_utf8_text(result.content))
         print_tool_result(name, content)
         self._record_tool_outcome(name, not result.is_error)
@@ -890,6 +900,7 @@ class Agent:
     def clear_history(self)->None:
         self._anthropic_messages = []
         self._openai_messages = []
+        self._history_epoch += 1
         self._pending_skill_extraction_window = None
         self._last_retrieved_skill_reference = None
         self._last_retrieved_skill_hits = []
@@ -957,6 +968,13 @@ class Agent:
             self._openai_messages = _sanitize_for_utf8(data["openaiMessages"])
         if isinstance(data.get("foldedSessionMemories"), list):
             self._folded_session_memories = _sanitize_for_utf8(data["foldedSessionMemories"])
+        # 检查点和撤销栈一起恢复，--resume 之后仍可 /undo、/rewind。
+        if isinstance(data.get("checkpoints"), list):
+            self._checkpoints = data["checkpoints"]
+            self._turn_counter = int(data.get("turnCounter", len(self._checkpoints)))
+            self._history_epoch = int(data.get("historyEpoch", 0))
+        if isinstance(data.get("editHistory"), dict):
+            self._edit_history.load_dict(data["editHistory"])
         print_info(f"Session restored ({self._get_message_count()} messages).")
 
 
@@ -1029,6 +1047,10 @@ class Agent:
                 "anthropicMessages": _sanitize_for_utf8(self._anthropic_messages) if not self.use_openai else None,
                 "openaiMessages": _sanitize_for_utf8(self._openai_messages) if self.use_openai else None,
                 "foldedSessionMemories": _sanitize_for_utf8(self._folded_session_memories),
+                "checkpoints": self._checkpoints,
+                "turnCounter": self._turn_counter,
+                "historyEpoch": self._history_epoch,
+                "editHistory": self._edit_history.to_dict(),
             })
         except Exception:
             pass
@@ -1053,6 +1075,7 @@ class Agent:
             duration_ms=round((time.monotonic() - started) * 1000), **self._trace_fields(),
         )
         if compacted:
+            self._history_epoch += 1
             print_info("Conversation compacted.")
         return compacted
 
@@ -1423,6 +1446,7 @@ class Agent:
         """清空历史信息，但是保留系统prompt."""
         self._anthropic_messages = []
         self._openai_messages = []
+        self._history_epoch += 1
         if self.use_openai:
             self._openai_messages.append({"role": "system", "content": self._system_prompt})
         self.last_input_token_count = 0
@@ -2104,6 +2128,75 @@ class Agent:
         if offer_all and answer.startswith("a"):
             return "all"
         return "yes" if answer.startswith("y") else "no"
+
+    # ── 检查点与 /rewind ──────────────────────────────────
+    def _record_checkpoint(self, user_message: str) -> None:
+        self._turn_counter += 1
+        self._checkpoints.append({
+            "turn": self._turn_counter,
+            "ts": time.time(),
+            "preview": " ".join(user_message.split())[:60],
+            "anthropic_len": len(self._anthropic_messages),
+            "openai_len": len(self._openai_messages),
+            "edits": len(self._edit_history),
+            "shell_runs": self._edit_history.shell_runs,
+            "epoch": self._history_epoch,
+        })
+
+    def list_checkpoints(self) -> list[dict[str, Any]]:
+        """每个检查点附上：之后改过几处文件、是否跑过 shell、对话还能不能回退。"""
+        out = []
+        for cp in self._checkpoints:
+            out.append({
+                **cp,
+                "file_changes_since": max(len(self._edit_history) - cp["edits"], 0),
+                "shell_since": self._edit_history.shell_runs > cp["shell_runs"],
+                "conversation_rewindable": cp["epoch"] == self._history_epoch,
+            })
+        return out
+
+    def rewind(self, turn: int, mode: str = "both", *, force: bool = False) -> tuple[bool, str]:
+        """
+        回到第 turn 轮开始之前。mode: both（对话和代码）/ conversation（只回退对话）/ code（只回退代码）。
+        先回退代码：有冲突时整个操作取消，对话不动。
+        """
+        if mode not in ("both", "conversation", "code"):
+            return False, f"Unknown rewind mode: {mode}"
+        cp = next((c for c in self._checkpoints if c["turn"] == turn), None)
+        if cp is None:
+            return False, f"No checkpoint for turn {turn}."
+        if mode != "code" and cp["epoch"] != self._history_epoch:
+            return False, (f"The conversation was compacted or cleared after turn {turn}, so it can't be "
+                           f"rewound to that point. You can still rewind code: /rewind {turn} code")
+        notes: list[str] = []
+        if self._edit_history.shell_runs > cp["shell_runs"]:
+            notes.append("Shell commands ran after this point; their effects on disk were NOT reverted.")
+        restored: list[Path] = []
+        if mode in ("both", "code"):
+            ok, message, restored = self._edit_history.undo_to(cp["edits"], force=force)
+            if not ok:
+                return False, message
+            notes.insert(0, message)
+            for path in restored:
+                self._read_file_state.pop(str(path), None)
+        if mode in ("both", "conversation"):
+            self._anthropic_messages = self._anthropic_messages[:cp["anthropic_len"]]
+            self._openai_messages = self._openai_messages[:cp["openai_len"]]
+            self._checkpoints = [c for c in self._checkpoints if c["turn"] < turn]
+            self._pending_skill_extraction_window = None
+            notes.insert(0, f"Conversation rewound to before turn {turn}.")
+            if mode == "conversation" and len(self._edit_history) > cp["edits"]:
+                self._pending_notices.append(
+                    "[System note: the user rewound the conversation, but files changed in the removed turns were "
+                    "kept on disk. Re-read files before editing them.]")
+        if mode == "code" and restored:
+            self._pending_notices.append(
+                f"[System note: the user reverted files to their state before turn {turn}: "
+                + ", ".join(str(p) for p in restored) + ". Re-read them before editing.]")
+        self._recorder.emit("rewind", turn=turn, mode=mode, forced=force,
+                            files_restored=[str(p) for p in restored], **self._trace_fields())
+        self._auto_save()
+        return True, " ".join(notes)
 
     # ── /undo ────────────────────────────────────────────
     def undo_last_edit(self, *, force: bool = False) -> tuple[bool, str]:
