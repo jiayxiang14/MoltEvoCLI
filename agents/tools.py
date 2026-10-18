@@ -16,6 +16,7 @@ from pathlib import Path
 from tqdm.utils import IS_WIN
 
 from agents.memory import get_memory_dir
+from agents import shell_policy
 from agents.snapshots import EditHistory
 from agents.tool_result import ToolResult
 
@@ -689,6 +690,21 @@ DANGEROUS_PATTERNS = [
     re.compile(r"\bRemove-Item\s", re.IGNORECASE),
     re.compile(r"\bStop-Process\s", re.IGNORECASE),
 ]
+def _write_roots() -> list[Path]:
+    """允许写入的根目录：项目目录、agent 的记忆目录和计划文件目录。"""
+    return [Path.cwd().resolve(), get_memory_dir().resolve(), (Path.home() / ".moltevo" / "plans").resolve()]
+
+
+def _allowed_commands() -> set[str]:
+    """内置白名单 + settings.json 里的 allowed_commands（用户级和项目级）。"""
+    allowed = set(shell_policy.DEFAULT_ALLOWED_COMMANDS)
+    for path in (Path.home() / ".moltevo" / "settings.json", Path.cwd() / ".moltevo" / "settings.json"):
+        extra = (_load_settings(path) or {}).get("allowed_commands")
+        if isinstance(extra, list):
+            allowed |= {str(c) for c in extra}
+    return allowed
+
+
 def is_dangerous(command: str) -> bool:
     return any(p.search(command) for p in DANGEROUS_PATTERNS)
 
@@ -783,6 +799,13 @@ def check_permission(
         return {"action": "allow"}
 
     if tool_name in READ_TOOLS:
+        # 读取敏感路径（~/.ssh、.env、私钥等）也要确认。
+        target = inp.get("file_path") or inp.get("path") or ""
+        if target and shell_policy.is_sensitive_path(str(target)):
+            message = f"read a sensitive path: {target}"
+            if mode == "dontAsk":
+                return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {message}"}
+            return {"action": "confirm", "message": message}
         return {"action": "allow"}
 
     if mode == "plan":
@@ -796,6 +819,14 @@ def check_permission(
 
     if tool_name in ("enter_plan_mode", "exit_plan_mode"):
         return {"action": "allow"}
+
+    # 项目边界：写到项目目录外（agent 自己的记忆和计划目录除外）即使在 acceptEdits 下也要确认。
+    if tool_name in ("write_file", "edit_file") and inp.get("file_path"):
+        if not shell_policy.is_within(str(inp["file_path"]), _write_roots()):
+            message = f"write outside the project: {inp['file_path']}"
+            if mode == "dontAsk":
+                return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {message}"}
+            return {"action": "confirm", "message": message, "cacheable": False}
 
     if mode == "acceptEdits" and tool_name in EDIT_TOOLS:
         return {"action": "allow"}
@@ -814,9 +845,13 @@ def check_permission(
     needs_confirm = False
     confirm_message = ""
 
-    if tool_name == "run_shell" and is_dangerous(inp.get("command", "")):
-        needs_confirm = True
-        confirm_message = inp.get("command", "")
+    if tool_name == "run_shell":
+        command = inp.get("command", "")
+        action, reason = shell_policy.evaluate(command, allowed=_allowed_commands(),
+                                               write_roots=_write_roots(), dangerous=is_dangerous(command))
+        if action == "confirm":
+            needs_confirm = True
+            confirm_message = reason
     elif tool_name == "write_file" and not _resolve_tool_path(inp.get("file_path", ""), must_exist=False).exists():
         needs_confirm = True
         confirm_message = f"write new file: {inp.get('file_path', '')}"
