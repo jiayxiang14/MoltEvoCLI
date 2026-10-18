@@ -486,6 +486,40 @@ def record_skill_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, A
     return {"ok": True, "judgments": len(judgments), "pruned": pruned}
 
 
+def record_skill_outcomes(skill_names: list[str], *, feedback: str, tool_error_rate: float | None,
+                          verify_passed: bool | None) -> dict[str, Any]:
+    """
+    记录"用了这个 Skill 的那一轮"效果如何：下一条用户消息是接受还是纠正、本轮工具失败率、验证是否通过。
+    工具失败率已排除"读不到"类基础设施错误（权限被拒、服务不可用），这类问题不算 Skill 的责任。
+    """
+    stats_path = get_evolution_dir() / SKILL_USAGE_STATS
+    stats = _read_json(stats_path, {})
+    pruned: list[str] = []
+    for name in skill_names:
+        item = stats.setdefault(name, {"retrieved": 0, "relevant": 0, "used": 0})
+        if not item.get("skill_dir"):
+            # 淘汰时要按目录判断作者并移动，统计项里没有就按名字查出来。
+            from .skills import get_skill_by_name
+            skill = get_skill_by_name(name)
+            if skill:
+                item["skill_dir"] = skill.skill_dir
+                item.setdefault("source", skill.source)
+        item["outcomes"] = int(item.get("outcomes", 0)) + 1
+        if feedback == "corrected":
+            item["corrected"] = int(item.get("corrected", 0)) + 1
+        elif feedback == "accepted":
+            item["accepted"] = int(item.get("accepted", 0)) + 1
+        if tool_error_rate is not None:
+            item["tool_error_rate_sum"] = round(float(item.get("tool_error_rate_sum", 0.0)) + tool_error_rate, 4)
+        if verify_passed is not None:
+            key = "verify_passed" if verify_passed else "verify_failed"
+            item[key] = int(item.get(key, 0)) + 1
+        if _maybe_prune_stale_skill(name, item):
+            pruned.append(name)
+    _write_json(stats_path, stats)
+    return {"ok": True, "pruned": pruned}
+
+
 def _maybe_prune_stale_skill(skill_name: str, stats: dict[str, Any]) -> bool:
     """
     淘汰规则：检索 >= 15 次且使用率 < 10%。项目级和用户级一视同仁，但只自动淘汰 agent 产生的 Skill；
@@ -498,7 +532,11 @@ def _maybe_prune_stale_skill(skill_name: str, stats: dict[str, Any]) -> bool:
     except ValueError:
         max_used_rate = 0.1
     retrieved = int(stats.get("retrieved", 0))
-    if retrieved < min_retrieved or int(stats.get("used", 0)) / retrieved >= max_used_rate:
+    rarely_used = retrieved >= min_retrieved and int(stats.get("used", 0)) / retrieved < max_used_rate
+    # "用了之后效果明显更差"：至少 5 次有结果记录，其中 60% 以上被用户纠正。
+    outcomes = int(stats.get("outcomes", 0))
+    often_corrected = outcomes >= 5 and int(stats.get("corrected", 0)) / outcomes >= 0.6
+    if not (rarely_used or often_corrected):
         return False
     skill_dir = Path(str(stats.get("skill_dir") or ""))
     if not skill_dir.is_dir():

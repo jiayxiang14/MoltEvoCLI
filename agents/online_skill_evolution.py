@@ -84,14 +84,23 @@ async def extract_online_skill_candidate(
     side_query: SideQuery,
     retrieved_reference: dict[str, Any] | None = None,
     hint: str = "",
+    execution_trace: list[dict[str, Any]] | None = None,
+    existing_memories: list[dict[str, str]] | None = None,
+    feedback_out: dict[str, str] | None = None,
 ) -> OnlineSkillCandidate | None:
     system = (
         "You are MoltEvo CLI's online Skill Extractor.\n"
         "Extract at most ONE reusable skill candidate from a live conversation window.\n"
-        "Output ONLY strict JSON: {\"skills\": []} or {\"skills\": [{...}]}.\n\n"
+        "Output ONLY strict JSON: {\"skills\": [], \"feedback\": \"neutral\"} or {\"skills\": [{...}], \"feedback\": \"...\"}.\n\n"
         "Candidate fields: name, description, when_to_use, instructions, evidence, tags.\n\n"
         "Rules:\n"
         "- USER turns are the primary evidence. Assistant turns are context only.\n"
+        "- execution_trace is also valid evidence for a durable, project-specific workaround: a tool call that failed "
+        "followed by a different approach that succeeded, or verification that went from failing to passing. "
+        "Failures marked infrastructure (permission denials, unavailable servers) are not lessons.\n"
+        "- Do not extract anything already covered by existing_feedback_memories.\n"
+        "- Also report how the next user turn reacted to the previous assistant reply in \"feedback\": "
+        "\"accepted\", \"corrected\" or \"neutral\" (neutral when there is no next user turn).\n"
         "- A next user feedback turn may confirm, reject, or refine the prior assistant behavior.\n"
         "- Do not extract assistant-only guesses, weak confirmations, one-off task payload, secrets, project facts, URLs, account IDs, exact dates, or temporary parameters.\n"
         "- Extract only durable workflow, output policy, implementation preference, correction, or repeated constraint likely useful for future similar tasks.\n"
@@ -103,8 +112,13 @@ async def extract_online_skill_candidate(
         "messages": messages,
         "hint": hint,
         "retrieved_reference": retrieved_reference or None,
+        "execution_trace": execution_trace or [],
+        "existing_feedback_memories": existing_memories or [],
     }
     parsed = _parse_json_object(await side_query(system, json.dumps(payload, ensure_ascii=False)))
+    if feedback_out is not None:
+        fb = str(parsed.get("feedback") or "neutral").strip().lower()
+        feedback_out["feedback"] = fb if fb in ("accepted", "corrected", "neutral") else "neutral"
     skills = parsed.get("skills")
     if not isinstance(skills, list) or not skills:
         return None
@@ -239,15 +253,21 @@ async def online_ingest(
     target: str = "project",
     session_id: str = "",
     window_id: str = "",
+    execution_trace: list[dict[str, Any]] | None = None,
+    existing_memories: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     from .skills import record_online_provenance
 
+    feedback: dict[str, str] = {}
     try:
         candidate = await extract_online_skill_candidate(
             messages=messages,
             side_query=side_query,
             retrieved_reference=retrieved_reference,
             hint=hint,
+            execution_trace=execution_trace,
+            existing_memories=existing_memories,
+            feedback_out=feedback,
         )
     except Exception as exc:
         result = {"ok": False, "action": "failed", "error": str(exc)}
@@ -261,7 +281,7 @@ async def online_ingest(
         return result
 
     if candidate is None:
-        result = {"ok": True, "action": "none"}
+        result = {"ok": True, "action": "none", "feedback": feedback.get("feedback", "neutral")}
         record_online_provenance(
             action="none",
             result=result,
@@ -282,6 +302,7 @@ async def online_ingest(
         )
     except Exception as exc:
         result = {"ok": False, "action": "failed", "skill": candidate.name, "error": str(exc)}
+    result["feedback"] = feedback.get("feedback", "neutral")
 
     record_online_provenance(
         action=str(result.get("action") or "none"),

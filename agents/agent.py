@@ -243,6 +243,8 @@ class Agent:
         self._turn_counter = 0
         self._history_epoch = 0
         self._turn_preview = ""
+        # 本轮的执行轨迹摘要（工具、成败、退出码、验证结果），供自进化抽取经验和记录 Skill 效果。
+        self._turn_trace: list[dict[str, Any]] = []
         # 工具调用结果日志（按 tool_call_id）：一轮被打断后据此补结果，避免已执行的操作被重做。
         # 只有主 agent 的消息会存档和恢复，子 agent 只在内存里记。
         journal_path = None if is_sub_agent else SESSION_DIR / f"{self.session_id}.journal.jsonl"
@@ -525,6 +527,8 @@ class Agent:
         self._verify_attempts = 0
         self._verify_failed = False
         self._turn_preview = original_user_message
+        if not self.is_sub_agent:
+            self._turn_trace = []
 
         self._aborted = False
         self._turn_output_buffer = []
@@ -696,6 +700,13 @@ class Agent:
         )
         result.content = content
         self._journal.done(call_id, name, result)
+        if not self.is_sub_agent:
+            self._turn_trace.append({
+                "tool": name, "args": summarize_args(inp)[:200], "is_error": result.is_error,
+                "exit_code": result.meta.get("exit_code"),
+                # "读不到"类错误（服务不可用等）不算经验，也不算 Skill 的责任。
+                "infrastructure": result.is_error and ("is unavailable" in content or "not connected" in content),
+            })
         if name in ("write_file", "edit_file") and not result.is_error and self._writes_memory(inp):
             # 记忆索引是系统提示词的一部分；系统提示词不再每轮重建，所以写记忆后单独刷新。
             self._refresh_runtime_system_prompt()
@@ -878,6 +889,8 @@ class Agent:
             "latest_assistant": assistant_text,
             "retrieved_reference": self._compact_retrieved_reference(retrieved_reference),
             "session_id": self.session_id,
+            "execution_trace": list(self._turn_trace[-30:]),
+            "used_skills": [],      # 使用评判在后台完成后补上
         }
 
     def _compact_retrieved_reference(self, ref: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -910,7 +923,10 @@ class Agent:
             target=os.environ.get("MOLTEVO_AUTO_SKILL_TARGET", "project"),
             session_id=self.session_id,
             window_id=window_id(window),
+            execution_trace=window.get("execution_trace") or [],
+            existing_memories=self._feedback_memories(),
         )
+        self._record_skill_outcomes(window, result.get("feedback", "neutral"))
         if not result.get("ok"):
             print_error(f"Online skill evolution failed: {result.get('error') or result}")
             return
@@ -961,8 +977,39 @@ class Agent:
             result = record_usage_judgments(judgments)
             if result.get("pruned"):
                 self._refresh_runtime_system_prompt()
+            used = [j["name"] for j in judgments if j.get("used")]
+            window = self._pending_skill_extraction_window
+            if used and window is not None and window.get("latest_assistant") == assistant_text:
+                window["used_skills"] = used
         except Exception:
             return
+
+    def _feedback_memories(self) -> list[dict[str, str]]:
+        try:
+            from .memory import list_memories
+            return [{"name": m.name, "description": m.description} for m in list_memories() if m.type == "feedback"][:50]
+        except Exception:
+            return []
+
+    def _record_skill_outcomes(self, window: dict[str, Any], feedback: str) -> None:
+        """把上一轮用过的 Skill 和这一轮观察到的效果关联起来（用户接受/纠正、工具失败率、验证结果）。"""
+        used = window.get("used_skills") or []
+        if not used:
+            return
+        trace = window.get("execution_trace") or []
+        tools = [t for t in trace if "tool" in t and not t.get("infrastructure")]
+        error_rate = (sum(t["is_error"] for t in tools) / len(tools)) if tools else None
+        verifies = [t["passed"] for t in trace if "verify" in t]
+        try:
+            from .skill_evolution import record_skill_outcomes
+            result = record_skill_outcomes(used, feedback=feedback, tool_error_rate=error_rate,
+                                           verify_passed=verifies[-1] if verifies else None)
+            if result.get("pruned"):
+                from .skills import reset_skill_cache
+                reset_skill_cache()
+                self._refresh_runtime_system_prompt()
+        except Exception:
+            pass
 
     async def extract_now(self, hint: str = "") -> dict[str, Any]:
         pending = self._pending_skill_extraction_window
@@ -2258,6 +2305,7 @@ class Agent:
             timed_out=result.meta.get("timed_out", False),
             duration_ms=round((time.monotonic() - started) * 1000), **self._trace_fields(),
         )
+        self._turn_trace.append({"verify": self.verify_command, "passed": not result.is_error})
         if not result.is_error:
             print_info("Verification passed.")
             self._verify_failed = False
