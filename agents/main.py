@@ -148,6 +148,46 @@ def _resolve_api_config(cli_api_base: str | None) -> tuple[str | None, str | Non
     return None, None, False
 
 
+def _review_skill_candidates(agent: Agent) -> None:
+    """/skills review：逐个展示待批准的 Skill 候选（合并类附 diff），选择批准、拒绝或跳过。"""
+    import difflib
+    from .skill_candidates import approve, pending, reject
+    from .skills import get_skill_by_name
+    items = pending()
+    if not items:
+        print_info("No skill candidates waiting for review.")
+        return
+    for record in items:
+        target = record.get("target_skill") or record["name"]
+        header = (f"{record['action']} {target}  (seen {record.get('occurrences', 0)}x"
+                  + (", changes a user-written skill" if record.get("target_is_manual") else "") + ")")
+        body = record.get("instructions", "")
+        if record["action"] == "merge":
+            current = get_skill_by_name(target)
+            old = current.prompt_template if current else ""
+            body = "\n".join(difflib.unified_diff(old.splitlines(), body.splitlines(),
+                                                  fromfile=f"{target} (current)", tofile=f"{target} (candidate)",
+                                                  lineterm="")) or body
+        if record.get("problems"):
+            header += "  [blocked: " + "; ".join(record["problems"]) + "]"
+        print_info(f"{header}\n{record.get('description', '')}\n\n{body[:4000]}")
+        try:
+            choice = input("  [a]pprove / [r]eject / [s]kip: ").strip().lower()
+            mark_line_start()
+        except EOFError:
+            return
+        if choice.startswith("a"):
+            outcome = approve(record["key"])
+            if outcome.get("ok"):
+                agent._refresh_runtime_system_prompt()
+                print_info(f"Promoted: {target}")
+            else:
+                print_warning(f"Not promoted: {outcome.get('error')}")
+        elif choice.startswith("r"):
+            reject(record["key"])
+            print_info(f"Rejected: {target}")
+
+
 _REWIND_MODES = {"b": "both", "both": "both", "c": "conversation", "conversation": "conversation",
                  "f": "code", "files": "code", "code": "code"}
 
@@ -303,6 +343,9 @@ async def run_repl(agent: Agent) -> None:
             else:
                 print_memory_entries(memories)
             continue
+        if inp == "/skills review":
+            _review_skill_candidates(agent)
+            continue
         if inp == "/skills":
             skills = discover_skills()
             if not skills:
@@ -437,6 +480,7 @@ REPL commands:
   /plan               Toggle plan mode (read-only <-> normal)
   /cost               Show token usage and cost
   /stats              Show tool calls, failure rate, latency and cost for this session
+  /skills review      Approve or reject pending skill candidates
   /undo               Revert the agent's last file change (/undo list, /undo --force)
   /rewind [N [both|conversation|code]] [--force]
                       Go back to the state before turn N (lists turns when N is omitted)

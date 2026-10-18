@@ -140,8 +140,10 @@ async def maintain_online_skill_candidate(
     retrieved_reference: dict[str, Any] | None = None,
     confirm_write: ConfirmWrite | None = None,
     target: str = "project",
+    session_id: str = "",
+    window_id: str = "",
 ) -> dict[str, Any]:
-    from .skills import create_skill, discover_skills, evolve_skill, retrieve_relevant_skills
+    from .skills import discover_skills, retrieve_relevant_skills
 
     skills = discover_skills()
     exact_target = _exact_identity_match(candidate, skills)
@@ -201,45 +203,30 @@ async def maintain_online_skill_candidate(
     if action == "discard":
         return {"ok": True, "action": "discard", "skill": "", "decision": decision}
 
-    write_summary = f"online skill evolution: {action} {target_skill or candidate.name}"
-    if confirm_write is not None and not await confirm_write(write_summary):
-        return {
-            "ok": False,
-            "action": f"{action}_denied",
-            "skill": target_skill or candidate.name,
-            "error": "permission denied",
-            "decision": decision,
-        }
-
     if action == "merge":
         target_skill = target_skill or top_reference_name
         if not target_skill:
             return {"ok": False, "action": "merge", "error": "missing target_skill", "decision": decision}
-        result = evolve_skill(
-            skill_name=target_skill,
-            lesson=candidate.evidence or candidate.description,
-            rationale=str(decision.get("reason") or "Online maintainer merge"),
-            target="active",
-            instructions=str(decision.get("merged_instructions") or candidate.instructions),
-            description=str(decision.get("merged_description") or ""),
-            when_to_use=str(decision.get("merged_when_to_use") or candidate.when_to_use),
-            tags=candidate.tags,
-        )
-        return {"action": "merge", "candidate": asdict(candidate), "decision": decision, **result}
 
-    result = create_skill(
+    # 不再直接写进生效中的 Skill：先进候选区，过了门禁才晋升（见 skill_candidates.py）。
+    from .skill_candidates import skill_author, stage
+    target_def = next((s for s in skills if getattr(s, "name", "") == target_skill), None) if action == "merge" else None
+    record = stage(
+        action=action,
         name=candidate.name,
-        description=candidate.description,
-        instructions=candidate.instructions,
-        when_to_use=candidate.when_to_use,
-        target=target,
-        context="inline",
-        user_invocable=False,
-        evidence=candidate.evidence,
-        actor="online",
+        target_skill=target_skill if action == "merge" else "",
+        description=str(decision.get("merged_description") or candidate.description) if action == "merge" else candidate.description,
+        when_to_use=str(decision.get("merged_when_to_use") or candidate.when_to_use),
+        instructions=str(decision.get("merged_instructions") or candidate.instructions) if action == "merge" else candidate.instructions,
         tags=candidate.tags,
+        evidence=candidate.evidence,
+        reason=str(decision.get("reason") or ""),
+        session_id=session_id,
+        window_id=window_id,
+        target_is_manual=bool(target_def and skill_author(getattr(target_def, "skill_dir", "")) != "agent"),
     )
-    return {"action": "add", "candidate": asdict(candidate), "decision": decision, **result}
+    return {"ok": True, "action": "staged", "skill": target_skill or candidate.name, "candidate": asdict(candidate),
+            "decision": decision, "record": record}
 
 
 async def online_ingest(
@@ -250,6 +237,8 @@ async def online_ingest(
     hint: str = "",
     confirm_write: ConfirmWrite | None = None,
     target: str = "project",
+    session_id: str = "",
+    window_id: str = "",
 ) -> dict[str, Any]:
     from .skills import record_online_provenance
 
@@ -288,6 +277,8 @@ async def online_ingest(
             retrieved_reference=retrieved_reference,
             confirm_write=confirm_write,
             target=target,
+            session_id=session_id,
+            window_id=window_id,
         )
     except Exception as exc:
         result = {"ok": False, "action": "failed", "skill": candidate.name, "error": str(exc)}

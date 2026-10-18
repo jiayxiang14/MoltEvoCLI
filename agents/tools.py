@@ -690,6 +690,13 @@ DANGEROUS_PATTERNS = [
     re.compile(r"\bRemove-Item\s", re.IGNORECASE),
     re.compile(r"\bStop-Process\s", re.IGNORECASE),
 ]
+def _is_user_written_skill(name: str) -> bool:
+    from agents.skill_candidates import skill_author
+    from agents.skills import get_skill_by_name
+    skill = get_skill_by_name(str(name or ""))
+    return bool(skill) and skill_author(skill.skill_dir) != "agent"
+
+
 def _write_roots() -> list[Path]:
     """允许写入的根目录：项目目录、agent 的记忆目录和计划文件目录。"""
     return [Path.cwd().resolve(), get_memory_dir().resolve(), (Path.home() / ".moltevo" / "plans").resolve()]
@@ -827,6 +834,13 @@ def check_permission(
             if mode == "dontAsk":
                 return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {message}"}
             return {"action": "confirm", "message": message, "cacheable": False}
+
+    # 用户手写的 Skill 对 agent 只读：模型想用 skill_evolve 改它，即使在 acceptEdits 下也要确认。
+    if tool_name == "skill_evolve" and _is_user_written_skill(inp.get("skill_name", "")):
+        message = f"modify user-written skill: {inp.get('skill_name', '')}"
+        if mode == "dontAsk":
+            return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {message}"}
+        return {"action": "confirm", "message": message, "cacheable": False}
 
     if mode == "acceptEdits" and tool_name in EDIT_TOOLS:
         return {"action": "allow"}

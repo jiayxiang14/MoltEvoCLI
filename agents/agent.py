@@ -901,20 +901,45 @@ class Agent:
         except Exception:
             return
 
+        from .skill_candidates import approve, cleanup, gate, promote, window_id
         result = await online_ingest(
             messages=messages,
             side_query=side_query,
             retrieved_reference=window.get("retrieved_reference") or None,
             hint=str(window.get("hint") or ""),
-            confirm_write=self._confirm_online_skill_write if interactive_confirm else self._confirm_background_online_skill_write,
             target=os.environ.get("MOLTEVO_AUTO_SKILL_TARGET", "project"),
+            session_id=self.session_id,
+            window_id=window_id(window),
         )
-        if result.get("ok"):
-            if result.get("action") in {"add", "merge"}:
-                self._refresh_runtime_system_prompt()
-                print_info(f"Online skill {result.get('action')}: {result.get('skill')}")
-        elif result.get("action") not in {"add_denied", "merge_denied"}:
+        if not result.get("ok"):
             print_error(f"Online skill evolution failed: {result.get('error') or result}")
+            return
+        record = result.get("record")
+        if result.get("action") != "staged" or not record:
+            return
+        cleanup()
+        # 候选已进候选区；按权限模式决定能否晋升（门禁见 skill_candidates.gate）。
+        if interactive_confirm:
+            summary = (f"promote skill candidate: {record['action']} {record.get('target_skill') or record['name']}"
+                       f"\n{record.get('description', '')}")
+            if await self._confirm_online_skill_write(summary):
+                outcome = approve(record["key"])
+                if outcome.get("ok"):
+                    self._refresh_runtime_system_prompt()
+                    print_info(f"Skill promoted: {result.get('skill')}")
+                else:
+                    print_warning(f"Skill not promoted: {outcome.get('error')}")
+            return
+        auto = self.permission_mode in {"acceptEdits", "bypassPermissions"}
+        ok, why = gate(record, auto=auto)
+        if ok:
+            outcome = promote(record)
+            if outcome.get("ok"):
+                self._refresh_runtime_system_prompt()
+                print_info(f"Skill promoted ({why}): {result.get('skill')}")
+            return
+        if not record.get("problems") and (not auto or record.get("target_is_manual")):
+            print_info(f"Skill candidate waiting for review ({why}): {result.get('skill')} — run /skills review")
 
     async def _run_skill_usage_tracking(self, original_user_message: str, assistant_text: str) -> None:
         if not self._online_evolution_enabled() or self.permission_mode == "plan":

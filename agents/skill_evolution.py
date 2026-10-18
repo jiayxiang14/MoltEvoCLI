@@ -320,6 +320,9 @@ def create_skill_file(
         "user-invocable": "true" if user_invocable else "false",
         "context": _normalize_context(context),
     }
+    if actor in ("agent", "online"):
+        # agent 产生的 Skill 打上标记：可以被自动淘汰；没有这个标记的视为用户手写，对 agent 只读。
+        meta["author"] = "agent"
     if when_to_use:
         meta["when-to-use"] = re.sub(r"\s+", " ", str(when_to_use).strip())
     if tags:
@@ -484,19 +487,26 @@ def record_skill_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, A
 
 
 def _maybe_prune_stale_skill(skill_name: str, stats: dict[str, Any]) -> bool:
-    min_retrieved = _parse_int(os.environ.get("MOLTEVO_SKILL_USAGE_PRUNE_MIN_RETRIEVED"), 40)
-    max_used = _parse_int(os.environ.get("MOLTEVO_SKILL_USAGE_PRUNE_MAX_USED"), 0)
-    source = str(stats.get("source") or "").strip().lower()
-    if source != "user" and os.environ.get("MOLTEVO_SKILL_PRUNE_PROJECT", "").strip().lower() not in {"1", "true", "yes", "on"}:
-        return False
-    if int(stats.get("retrieved", 0)) < min_retrieved:
-        return False
-    if int(stats.get("used", 0)) > max_used:
+    """
+    淘汰规则：检索 >= 15 次且使用率 < 10%。项目级和用户级一视同仁，但只自动淘汰 agent 产生的 Skill；
+    用户手写的只标记 flagged_stale，不移走。（原规则只淘汰用户级，而自动产生的都在项目级，永远不会被淘汰。）
+    """
+    from .skill_candidates import skill_author
+    min_retrieved = _parse_int(os.environ.get("MOLTEVO_SKILL_USAGE_PRUNE_MIN_RETRIEVED"), 15)
+    try:
+        max_used_rate = float(os.environ.get("MOLTEVO_SKILL_PRUNE_MAX_USED_RATE", "0.1"))
+    except ValueError:
+        max_used_rate = 0.1
+    retrieved = int(stats.get("retrieved", 0))
+    if retrieved < min_retrieved or int(stats.get("used", 0)) / retrieved >= max_used_rate:
         return False
     skill_dir = Path(str(stats.get("skill_dir") or ""))
     if not skill_dir.is_dir():
         return False
     if skill_dir.name.startswith("."):
+        return False
+    if skill_author(skill_dir) != "agent":
+        stats["flagged_stale"] = True
         return False
     archive_root = get_evolution_dir() / "pruned"
     archive_root.mkdir(parents=True, exist_ok=True)
