@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 from tqdm.utils import IS_WIN
@@ -381,48 +385,179 @@ def _list_files(inp: dict) -> str:
         return f"Error listing files: {e}"
 
 
-def _grep_search(inp: dict) -> str:
+#--------子进程执行：shell 和 grep 共用，不阻塞事件循环---------------------
+
+MAX_CAPTURE_BYTES = 1_000_000   # 单个输出流最多保留的字节数，超出只留开头和结尾
+SHELL_DEFAULT_TIMEOUT_MS = 30_000
+SHELL_MAX_TIMEOUT_MS = 600_000
+GREP_TIMEOUT_S = 10
+KILL_GRACE_S = 2                # SIGTERM 之后等这么久还不退出就 SIGKILL
+
+
+class _CappedBuffer:
+    """边读边存的输出缓冲：超过上限时保留开头和结尾，中间丢弃并计数，防止无限输出撑爆内存。"""
+
+    def __init__(self, limit: int = MAX_CAPTURE_BYTES):
+        self._half = limit // 2
+        self._head = bytearray()
+        self._tail = bytearray()
+        self._dropped = 0
+
+    def write(self, data: bytes) -> None:
+        if len(self._head) < self._half:
+            take = self._half - len(self._head)
+            self._head += data[:take]
+            data = data[take:]
+        if data:
+            self._tail += data
+            if len(self._tail) > self._half:
+                cut = len(self._tail) - self._half
+                self._dropped += cut
+                del self._tail[:cut]
+
+    def text(self) -> str:
+        out = self._head.decode("utf-8", errors="replace")
+        if self._dropped:
+            out += f"\n... [{self._dropped} bytes omitted] ...\n"
+        return out + self._tail.decode("utf-8", errors="replace")
+
+
+async def _pump(stream: asyncio.StreamReader, buf: _CappedBuffer) -> None:
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            return
+        buf.write(chunk)
+
+
+def _signal_process_group(proc: asyncio.subprocess.Process, sig: int) -> None:
+    # 不看 proc.returncode：shell 本身退出后，它启动的后台子进程可能还拿着输出管道，
+    # 只要进程组里还有成员，killpg 就能把它们一起带走。
+    try:
+        if IS_WIN:
+            if proc.returncode is None:
+                proc.kill()
+        else:
+            os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+async def _terminate_process_group(proc: asyncio.subprocess.Process) -> None:
+    _signal_process_group(proc, signal.SIGTERM)
+    try:
+        await asyncio.wait_for(proc.wait(), KILL_GRACE_S)
+    except asyncio.TimeoutError:
+        pass
+    _signal_process_group(proc, getattr(signal, "SIGKILL", signal.SIGTERM))
+    await proc.wait()
+
+
+async def _run_process(cmd: str | list[str], *, shell: bool, timeout_s: float) -> tuple[int | None, str, str, bool]:
+    """
+    运行子进程并返回 (退出码, stdout, stderr, 是否超时)。
+    - 新建进程组：超时或被取消时整组终止，不留孤儿进程。
+    - stdin 接 /dev/null：需要交互输入的命令立即读到 EOF，不会和 REPL 抢终端。
+    - 自己读输出流：超时后已经产生的输出仍然保留。
+    """
+    kwargs: dict = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+    }
+    if not IS_WIN:
+        kwargs["start_new_session"] = True
+    if shell:
+        proc = await asyncio.create_subprocess_shell(cmd, **kwargs)
+    else:
+        proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
+
+    out, err = _CappedBuffer(), _CappedBuffer()
+    finished = asyncio.ensure_future(
+        asyncio.gather(_pump(proc.stdout, out), _pump(proc.stderr, err), proc.wait())
+    )
+    timed_out = False
+    try:
+        # shield：超时只停止等待，读任务继续跑，进程组被杀后它们会读完剩余输出并结束。
+        await asyncio.wait_for(asyncio.shield(finished), timeout_s)
+    except asyncio.TimeoutError:
+        timed_out = True
+    finally:
+        # 超时、被取消（Ctrl+C）或出错都会走到这里：整组终止。
+        if not finished.done():
+            await _terminate_process_group(proc)
+            try:
+                await asyncio.wait_for(finished, KILL_GRACE_S)
+            except asyncio.TimeoutError:
+                finished.cancel()
+    return proc.returncode, out.text(), err.text(), timed_out
+
+
+def _format_grep_lines(lines: list[str]) -> str:
+    output = "\n".join(lines[:100])
+    if len(lines) > 100:
+        output += f"\n... and {len(lines) - 100} more matches"
+    return output
+
+
+async def _grep_search(inp: dict) -> str:
     pattern = inp["pattern"]
     path = str(_resolve_tool_path(inp.get("path") or "."))
     include = inp.get("include")
 
-    if not IS_WIN:
+    if not IS_WIN and shutil.which("grep"):
+        args = ["grep", "--line-number", "--color=never", "-r",
+                "--exclude-dir=.git", "--exclude-dir=node_modules"]
+        if include:
+            args.append(f"--include={include}")
+        args.extend(["--", pattern, path])
         try:
-            args = ["grep", "--line-number", "--color=never", "-r"]
-            if include:
-                args.append(f"--include={include}")
-            args.extend(["--", pattern, path])
+            returncode, stdout, _stderr, timed_out = await _run_process(args, shell=False, timeout_s=GREP_TIMEOUT_S)
+        except OSError:
+            returncode, stdout, timed_out = None, "", False
+        lines = [l for l in stdout.split("\n") if l]
+        if timed_out:
+            # 超时直接返回部分结果，不再退回 Python 全量重扫（那样更慢）。
+            note = f"[grep timed out after {GREP_TIMEOUT_S}s; results are partial. Narrow the path or use include.]"
+            return f"{_format_grep_lines(lines)}\n{note}" if lines else f"No matches found before timeout. {note}"
+        if returncode == 1:
+            return "No matches found."
+        if returncode == 0 or (returncode == 2 and lines):
+            # 退出码 2 且有结果：通常是个别文件无权限读取，结果仍然可用。
+            return _format_grep_lines(lines)
 
-            result = subprocess.run(
-                args, capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 1:
-                return "No matches found."
-            if result.returncode == 0:
-                lines = [l for l in result.stdout.split("\n") if l]
-                output = "\n".join(lines[:100])
-                if len(lines) >100:
-                    output += f"\n... and {len(lines) - 100} more matches"
-                return output
-        except Exception:
-            pass
-
-    return _grep_python(pattern, path, include)
+    # 没有 grep（如 Windows）或 grep 不接受这个模式：用 Python 实现，放进线程并设截止时间。
+    return await asyncio.to_thread(_grep_python, pattern, path, include)
 
 
 def _grep_python(pattern: str, directory: str, include: str | None) -> str:
-    regex = re.compile(pattern)
+    try:
+        regex = re.compile(pattern)
+    except re.error as e:
+        return f"Error: invalid regex pattern: {e}"
     include_pattern = include
     matches: list[str] = []
+    deadline = time.monotonic() + GREP_TIMEOUT_S
+    timed_out = False
 
     def walk(d: str) -> None:
+        nonlocal timed_out
         if len(matches) >= 200:
+            return
+        if time.monotonic() > deadline:
+            timed_out = True
             return
         try:
             entries = os.listdir(d)
         except Exception:
             return
         for name in entries:
+            # 每个条目前都检查：子目录超时或结果已满后，不再继续读同级文件。
+            if timed_out or len(matches) >= 200:
+                return
+            if time.monotonic() > deadline:
+                timed_out = True
+                return
             if name.startswith(".") or name == "node_modules":
                 continue
             full = os.path.join(d, name)
@@ -442,12 +577,10 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
                 pass
 
     walk(directory)
+    note = f"\n[search timed out after {GREP_TIMEOUT_S}s; results are partial. Narrow the path or use include.]" if timed_out else ""
     if not matches:
-        return "No matches found."
-    output = "\n".join(matches[:100])
-    if len(matches) > 100:
-        output += f"\n... and {len(matches) - 100} more matches"
-    return output
+        return "No matches found." + note
+    return _format_grep_lines(matches) + note
 
 
 
@@ -492,27 +625,33 @@ def get_deferred_tool_names(all_tools: list[ToolDef] | None = None) -> list[str]
     return [t["name"] for t in tools if t.get("deferred") and t["name"] not in _activated_tools]
 
 #执行shell命令
-def _run_shell(inp: dict) -> str:
+def _parse_timeout_ms(raw: object) -> float:
+    """模型传来的 timeout 可能是字符串或离谱的值：转成数字并限制在 1 秒到 10 分钟之间。"""
     try:
-        timeout_ms = inp.get("timeout", 30000)
-        timeout_s = timeout_ms / 1000
-        result = subprocess.run(
-            inp["command"],
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = SHELL_DEFAULT_TIMEOUT_MS
+    return min(max(value, 1000), SHELL_MAX_TIMEOUT_MS)
+
+
+async def _run_shell(inp: dict) -> str:
+    timeout_ms = _parse_timeout_ms(inp.get("timeout", SHELL_DEFAULT_TIMEOUT_MS))
+    try:
+        returncode, stdout, stderr, timed_out = await _run_process(
+            inp["command"], shell=True, timeout_s=timeout_ms / 1000
         )
-        output = result.stdout or ""
-        if result.returncode != 0:
-            stderr = f"\nStderr: {result.stderr}" if result.stderr else ""
-            stdout = f"\nStdout: {result.stdout}" if result.stdout else ""
-            return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
-        return output or "(no output)"
-    except subprocess.TimeoutExpired:
-        return f"Command timed out after {inp.get('timeout', 30000)}ms"
     except Exception as e:
         return f"Error: {e}"
+    stdout_part = f"\nStdout: {stdout}" if stdout else ""
+    stderr_part = f"\nStderr: {stderr}" if stderr else ""
+    if timed_out:
+        return (
+            f"Command timed out after {int(timeout_ms)}ms; the process group was terminated."
+            f" Output before timeout:{stdout_part or ' (none)'}{stderr_part}"
+        )
+    if returncode != 0:
+        return f"Command failed (exit code {returncode}){stdout_part}{stderr_part}"
+    return stdout or "(no output)"
 
 
 #危险命令检测模式列表
@@ -688,7 +827,8 @@ async def execute_tool(
     name: str, inp: dict, read_file_state: dict[str, float] | None = None
 ) -> str:
     if name == "read_file":
-        result = _read_file(inp)
+        # 读大文件可能耗时，放进线程，不阻塞事件循环；读写共享状态的代码留在主线程。
+        result = await asyncio.to_thread(_read_file, inp)
         if read_file_state is not None and not result.startswith("Error"):
             abs_path = str(_resolve_tool_path(inp["file_path"]).resolve())
             try:
@@ -753,19 +893,19 @@ async def execute_tool(
         )
         return _truncate_result(json.dumps(result, ensure_ascii=False, indent=2))
 
-    handlers: dict = {
-        "write_file": _write_file,
-        "edit_file": _edit_file,
-        "list_files": _list_files,
-        "grep_search": _grep_search,
-        "run_shell": _run_shell,
-    }
-    handler = handlers.get(name)
-
-    if not handler:
+    if name == "run_shell":
+        result = await _run_shell(inp)
+    elif name == "grep_search":
+        result = await _grep_search(inp)
+    elif name == "list_files":
+        # 大目录上的 glob 可能很慢，放进线程。
+        result = await asyncio.to_thread(_list_files, inp)
+    elif name in ("write_file", "edit_file"):
+        # 写操作留在主线程同步执行：很快，而且被取消时不会出现"线程里写完了、模型却不知道"的情况。
+        result = (_write_file if name == "write_file" else _edit_file)(inp)
+    else:
         return f"Unknown tool: {name}"
-
-    result = _truncate_result(handler(inp))
+    result = _truncate_result(result)
 
     # 更新时间
     if name in ("write_file", "edit_file") and read_file_state is not None and not result.startswith("Error"):

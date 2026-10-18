@@ -32,10 +32,16 @@ import asyncio
 import json
 import os
 import subprocess
+from collections import deque
 from pathlib import Path
 from typing import Any
 
 from .ui import print_error, print_info
+
+# 单行 JSON-RPC 消息的读取上限。asyncio 默认只有 64KB，浏览器快照这类大响应会超限。
+MCP_STREAM_LIMIT = 16 * 1024 * 1024
+# 保留 Server stderr 的最后若干行，用来在连接出错时给出原因。
+MCP_STDERR_TAIL_LINES = 20
 
 
 # ─── 单个 MCP 连接：一个 McpConnection 对应一个 MCP Server 子进程 ──────────────────
@@ -62,6 +68,11 @@ class McpConnection:
         self._pending: dict[int, asyncio.Future] = {}
         # 后台读取 stdout 的任务。MCP Server 的响应会从 stdout 持续读出。
         self._reader_task: asyncio.Task | None = None
+        # 后台读取 stderr 的任务：持续读走，防止管道写满后 Server 卡死；只保留最后几行。
+        self._stderr_task: asyncio.Task | None = None
+        self._stderr_tail: deque[str] = deque(maxlen=MCP_STDERR_TAIL_LINES)
+        # 连接断开的原因。非空表示连接已不可用，之后的请求立即失败。
+        self._dead_reason: str | None = None
 
     async def connect(self) -> None:
         """启动 MCP Server 子进程，并开始后台读取它的 stdout。"""
@@ -77,38 +88,94 @@ class McpConnection:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=merged_env,
+            limit=MCP_STREAM_LIMIT,
         )
         # 后台持续读取 stdout。这里不阻塞 connect()，否则后续无法继续初始化。
         self._reader_task = asyncio.create_task(self._read_loop())
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+
+    async def _drain_stderr(self) -> None:
+        assert self._process and self._process.stderr
+        try:
+            while True:
+                line = await self._process.stderr.readline()
+                if not line:
+                    return
+                self._stderr_tail.append(line.decode("utf-8", errors="replace").rstrip())
+        except (ValueError, asyncio.LimitOverrunError):
+            # 单行 stderr 超长：只是诊断信息，不影响连接，丢弃即可。
+            return
+
+    def _stderr_hint(self) -> str:
+        if not self._stderr_tail:
+            return ""
+        return "\nServer stderr (last lines):\n" + "\n".join(self._stderr_tail)
+
+    def _fail_pending(self, error: Exception) -> None:
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(error)
+        self._pending.clear()
 
     async def _read_loop(self) -> None:
         """持续读取 MCP Server stdout 中按行分隔的 JSON-RPC 响应。"""
         assert self._process and self._process.stdout
-        while True:
-            # MCP stdio 通常是一行一个 JSON-RPC 消息。
-            line = await self._process.stdout.readline()
-            if not line:
-                # 读不到内容说明子进程 stdout 已关闭，通常表示进程退出。
-                break
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                # 非法 JSON 直接忽略，避免单条脏输出打断整个连接。
-                continue
+        reason = "server closed stdout (process exited)"
+        try:
+            while True:
+                # MCP stdio 通常是一行一个 JSON-RPC 消息。
+                try:
+                    line = await self._process.stdout.readline()
+                except ValueError:
+                    # 单行超过读取上限：readline 已丢弃这一行，连接仍可继续使用。
+                    # 无法知道是哪个请求的响应，让当前等待中的请求立即失败，而不是等到超时。
+                    self._fail_pending(RuntimeError(
+                        f"MCP server '{self.server_name}' sent a message larger than "
+                        f"{MCP_STREAM_LIMIT // (1024 * 1024)}MB; the response was dropped"
+                    ))
+                    continue
+                if not line:
+                    # 读不到内容说明子进程 stdout 已关闭，通常表示进程退出。
+                    # 稍等 stderr 读完最后几行，错误信息里才有退出原因。
+                    if self._stderr_task:
+                        try:
+                            await asyncio.wait_for(asyncio.shield(self._stderr_task), 0.5)
+                        except asyncio.TimeoutError:
+                            pass
+                    break
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    # 非法 JSON 直接忽略，避免单条脏输出打断整个连接。
+                    continue
 
-            # JSON-RPC 响应会带 id；通知类消息通常没有 id。
-            msg_id = msg.get("id")
-            if msg_id is not None and msg_id in self._pending:
-                fut = self._pending.pop(msg_id)
-                if "error" in msg:
-                    # Server 返回 JSON-RPC error 时，把等待中的 Future 标记为异常。
-                    e = msg["error"]
-                    fut.set_exception(
-                        RuntimeError(f"MCP error {e.get('code')}: {e.get('message')}")
-                    )
-                else:
-                    # 正常响应只把 result 部分交给调用方。
-                    fut.set_result(msg.get("result"))
+                # JSON-RPC 响应会带 id；通知类消息通常没有 id。
+                msg_id = msg.get("id")
+                if msg_id is not None and msg_id in self._pending:
+                    fut = self._pending.pop(msg_id)
+                    if fut.done():
+                        continue
+                    if "error" in msg:
+                        # Server 返回 JSON-RPC error 时，把等待中的 Future 标记为异常。
+                        e = msg["error"]
+                        fut.set_exception(
+                            RuntimeError(f"MCP error {e.get('code')}: {e.get('message')}")
+                        )
+                    else:
+                        # 正常响应只把 result 部分交给调用方。
+                        fut.set_result(msg.get("result"))
+        except asyncio.CancelledError:
+            reason = "connection closed"
+            raise
+        except Exception as e:
+            reason = f"read loop crashed: {e}"
+        finally:
+            # 读循环不管因为什么退出，之后都不可能再收到响应：
+            # 让等待中的请求立即失败，并标记连接已断开，后续调用直接报错，不再干等超时。
+            self._dead_reason = reason
+            self._fail_pending(RuntimeError(
+                f"MCP server '{self.server_name}' is unavailable: {reason}{self._stderr_hint()}"
+            ))
 
     async def _send_request(self, method: str, params: dict | None = None) -> Any:
         """发送一条 JSON-RPC request，并等待对应 id 的 response。"""
@@ -125,15 +192,26 @@ class McpConnection:
         #   "params": {...}
         # }
         msg = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}})
-        # stdio 传输使用换行作为消息边界。
-        self._process.stdin.write((msg + "\n").encode())
-        await self._process.stdin.drain()
+        if self._dead_reason:
+            raise RuntimeError(
+                f"MCP server '{self.server_name}' is unavailable: {self._dead_reason}{self._stderr_hint()}"
+            )
 
-        # 创建 Future 并登记到 _pending，等待 _read_loop 收到相同 id 的响应后唤醒。
-        loop = asyncio.get_event_loop()
-        fut: asyncio.Future = loop.create_future()
+        # 先登记再发送：响应可能在 drain() 返回前就到达，晚登记会被读循环当成无主消息丢掉。
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
-        return await fut
+        try:
+            # stdio 传输使用换行作为消息边界。
+            self._process.stdin.write((msg + "\n").encode())
+            await self._process.stdin.drain()
+            return await fut
+        except (BrokenPipeError, ConnectionResetError) as e:
+            raise RuntimeError(
+                f"MCP server '{self.server_name}' is unavailable: {e}{self._stderr_hint()}"
+            ) from None
+        finally:
+            # 正常完成、超时被取消或发送失败，都撤掉登记，避免 _pending 越积越多。
+            self._pending.pop(req_id, None)
 
     def _send_notification(self, method: str, params: dict | None = None) -> None:
         """发送一条 JSON-RPC notification。notification 没有 id，也不等待响应。"""
@@ -169,9 +247,22 @@ class McpConnection:
             for t in result["tools"]
         ]
 
-    async def call_tool(self, name: str, args: dict) -> str:
-        """调用当前 MCP Server 上的某个工具，并把结果转换成字符串返回。"""
-        result = await self._send_request("tools/call", {"name": name, "arguments": args})
+    async def call_tool(self, name: str, args: dict, *, timeout: float = 60.0) -> str:
+        """调用当前 MCP Server 上的某个工具，并把结果转换成字符串返回。
+
+        _send_request 本身不带超时：如果 Server 子进程卡住（比如浏览器工具在
+        等一个永远不会完成的页面加载/网络请求），_pending 里的 Future 会永远
+        不被 resolve，调用方会被无限期挂起。这里用 wait_for 兜底，超时就让
+        调用方拿到一个可恢复的异常，而不是让整条 Agent Loop 卡死。
+        """
+        try:
+            result = await asyncio.wait_for(
+                self._send_request("tools/call", {"name": name, "arguments": args}), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"MCP tool '{name}' on server '{self.server_name}' timed out after {timeout}s"
+            ) from None
         if isinstance(result, dict) and isinstance(result.get("content"), list):
             # MCP 工具结果通常是 content block 列表。当前 Agent 只消费 text block。
             return "\n".join(
@@ -180,25 +271,30 @@ class McpConnection:
         # 如果不是标准 content list，就退回为 JSON 字符串，避免丢失信息。
         return json.dumps(result)
 
-    def close(self) -> None:
+    async def close(self) -> None:
         """关闭 MCP Server 子进程，并让所有等待中的请求失败。"""
-        if self._reader_task:
-            # 停止 stdout 后台读取任务。
-            self._reader_task.cancel()
-            self._reader_task = None
+        self._dead_reason = self._dead_reason or "connection closed"
+        for task in (self._reader_task, self._stderr_task):
+            # 停止 stdout / stderr 后台读取任务。
+            if task:
+                task.cancel()
+        self._reader_task = None
+        self._stderr_task = None
         if self._process:
+            process, self._process = self._process, None
             try:
                 # 直接杀掉子进程，确保外部 MCP Server 不继续残留。
-                self._process.kill()
+                process.kill()
             except ProcessLookupError:
                 # 进程已经退出时 kill 可能抛出该异常，忽略即可。
                 pass
-            self._process = None
+            # 等进程真正退出，避免留下僵尸进程。
+            try:
+                await asyncio.wait_for(process.wait(), 5)
+            except asyncio.TimeoutError:
+                pass
         # 连接关闭后，所有还没收到响应的请求都不可能再完成，需要显式置为异常。
-        for fut in self._pending.values():
-            if not fut.done():
-                fut.set_exception(RuntimeError(f"MCP server '{self.server_name}' closed"))
-        self._pending.clear()
+        self._fail_pending(RuntimeError(f"MCP server '{self.server_name}' closed"))
 
 
 # ─── MCP 管理器：统一管理多个 MCP Server 连接和工具路由 ─────────────────────────────
@@ -256,7 +352,7 @@ class McpManager:
             except Exception as e:
                 # 单个 Server 失败不影响其他 Server。失败连接需要关闭以清理子进程。
                 print_error(f"MCP failed to connect: {name}: {e}")
-                conn.close()
+                await conn.close()
 
     def get_tool_definitions(self) -> list[dict]:
         """返回 Agent/Anthropic 可直接使用的工具定义，并给 MCP 工具名加前缀。"""
@@ -293,7 +389,7 @@ class McpManager:
     async def disconnect_all(self) -> None:
         """断开所有 MCP Server 连接，并清空工具缓存。"""
         for conn in self._connections.values():
-            conn.close()
+            await conn.close()
         self._connections.clear()
         self._tools.clear()
         self._connected = False

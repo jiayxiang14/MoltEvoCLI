@@ -176,6 +176,8 @@ class Agent:
         self._current_task:asyncio.Task | None = None
         #权限白名单
         self._confirmed_paths: set[str] = set()
+        # 流式阶段提前启动的工具任务；本轮结束、中断或出错时统一取消，避免在后台继续跑。
+        self._inflight_tool_tasks: set[asyncio.Task] = set()
 
 
         # 计划模式”（Plan Mode）状态的变量
@@ -441,6 +443,7 @@ class Agent:
             raise
         finally:
             self._current_task = None
+            await self._cancel_inflight_tool_tasks()
         assistant_text = "".join(self._turn_output_buffer or []).strip()
         self._turn_output_buffer = None
         if not self.is_sub_agent and not self._aborted:
@@ -1253,6 +1256,15 @@ class Agent:
         self._same_tool_repeat_count = 0
         self._last_tool_name = ""
 
+    async def _cancel_inflight_tool_tasks(self) -> None:
+        """取消没被用到的提前执行任务，并等它们清理完（例如终止子进程组）。"""
+        pending = [t for t in self._inflight_tool_tasks if not t.done()]
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._inflight_tool_tasks.clear()
+
     def _spawn_sub_agent(self, system_prompt: str, tools: list[ToolDef]) -> "Agent":
         """
         派生子 agent 的唯一入口。
@@ -1352,6 +1364,8 @@ class Agent:
                 start_spinner()
 
 
+            # 上一次迭代因 context_break 等提前退出时，可能留下没被等待的提前执行任务。
+            await self._cancel_inflight_tool_tasks()
             # 保存“提前执行”的工具任务。key 是 Anthropic 返回的 tool_use block id。
             early_executions: dict[str, asyncio.Task] = {}
 
@@ -1364,6 +1378,8 @@ class Agent:
                     if perm["action"]=="allow":
                         task =asyncio.create_task(self._execute_tool_call(block["name"], block["input"]))
                         early_executions[block["id"]] = task
+                        self._inflight_tool_tasks.add(task)
+                        task.add_done_callback(self._inflight_tool_tasks.discard)
 
 
             # 调用 Anthropic 流式接口；流式过程中完成 tool block 时会触发 _on_tool_block。
