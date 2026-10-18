@@ -271,6 +271,10 @@ def print_stats(stats: dict) -> None:
     table.add_row("model", _safe_text(str(stats.get("model"))))
     table.add_row("model calls", f"{stats['model_calls']} (retries {stats['model_retries']}, "
                                  f"p50 {ms(stats['model_latency_ms_p50'])}, first token p50 {ms(stats['ttft_ms_p50'])})")
+    if stats.get("side_queries"):
+        sq = stats["side_query_tokens"]
+        table.add_row("side queries", f"{stats['side_queries']} ({sq['input']} in / {sq['output']} out tokens, "
+                                      f"memory / skill / fold)")
     rate = stats["tool_error_rate"]
     table.add_row("tool calls", f"{stats['tool_calls']} (errors {stats['tool_errors']}"
                                 + (f", {rate:.0%}" if rate is not None else "") + ")")

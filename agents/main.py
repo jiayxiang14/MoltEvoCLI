@@ -143,20 +143,22 @@ def _resolve_api_config(cli_api_base: str | None) -> tuple[str | None, str | Non
     return None, None, False
 
 
+async def repl_confirm(message: str, *, preview: str | None = None, offer_all: bool = False) -> str:
+    """REPL 的确认函数：返回用户输入的原始字符串，由 Agent._confirm_dangerous 统一解析。
+    a = 本会话后续的文件修改都自动同意（切换到 acceptEdits）。"""
+    prompt = "  Allow? (y/n/a = yes to all edits this session): " if offer_all else "  Allow? (y/n): "
+    try:
+        answer = input(prompt)
+        mark_line_start()
+        return answer
+    except EOFError:
+        return "n"
+
+
 async def run_repl(agent: Agent) -> None:
     """Interactive REPL loop."""
 
-    async def confirm_fn(message: str, *, preview: str | None = None, offer_all: bool = False) -> str:
-        # a = 本会话后续的文件修改都自动同意（切换到 acceptEdits）。
-        prompt = "  Allow? (y/n/a = yes to all edits this session): " if offer_all else "  Allow? (y/n): "
-        try:
-            answer = input(prompt)
-            mark_line_start()
-            return answer
-        except EOFError:
-            return "n"
-
-    agent.set_confirm_fn(confirm_fn)
+    agent.set_confirm_fn(repl_confirm)
 
     async def plan_approval_fn(plan_content: str) -> dict:
         print_plan_for_approval(plan_content)

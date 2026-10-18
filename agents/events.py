@@ -76,6 +76,9 @@ class RunRecorder:
         self.model_ttft_ms: list[float] = []
         self.model_calls = 0
         self.model_retries = 0
+        self.side_queries = 0
+        self.side_input_tokens = 0
+        self.side_output_tokens = 0
         self.permission_counts: dict[str, int] = {}
 
     # ── 写事件 ──────────────────────────────────────────
@@ -103,19 +106,25 @@ class RunRecorder:
 
     # ── 记录 + 汇总 ─────────────────────────────────────
     def record_model_call(self, *, cost_usd: float | None, latency_ms: float, ttft_ms: float | None,
-                          retries: int, cache_read: int, cache_write: int, **fields: Any) -> None:
-        self.model_calls += 1
-        self.model_retries += retries
-        self.model_latency_ms.append(latency_ms)
-        if ttft_ms is not None:
-            self.model_ttft_ms.append(ttft_ms)
+                          retries: int, cache_read: int, cache_write: int, event_type: str = "model_call",
+                          **fields: Any) -> None:
+        if event_type == "model_call":
+            self.model_calls += 1
+            self.model_retries += retries
+            self.model_latency_ms.append(latency_ms)
+            if ttft_ms is not None:
+                self.model_ttft_ms.append(ttft_ms)
+        else:
+            self.side_queries += 1
+            self.side_input_tokens += fields.get("input_tokens", 0) + cache_read + cache_write
+            self.side_output_tokens += fields.get("output_tokens", 0)
         self.cache_read_tokens += cache_read
         self.cache_write_tokens += cache_write
         if cost_usd is None:
             self.cost_unknown = True
         else:
             self.cost_usd += cost_usd
-        self.emit("model_call", cost_usd=cost_usd, latency_ms=round(latency_ms),
+        self.emit(event_type, cost_usd=cost_usd, latency_ms=round(latency_ms),
                   ttft_ms=round(ttft_ms) if ttft_ms is not None else None, retries=retries,
                   cache_read_tokens=cache_read, cache_write_tokens=cache_write, **fields)
 
@@ -130,6 +139,9 @@ class RunRecorder:
 
     def record_permission(self, *, tool: str, decision: str, **fields: Any) -> None:
         self.permission_counts[decision] = self.permission_counts.get(decision, 0) + 1
+        if fields.get("reason"):
+            # 确认提示里可能就是完整的 shell 命令，同样要打码。
+            fields["reason"] = redact(str(fields["reason"]))
         self.emit("permission", tool=tool, decision=decision, **fields)
 
     # ── 读统计 ──────────────────────────────────────────
@@ -140,6 +152,8 @@ class RunRecorder:
         return {
             "model_calls": self.model_calls,
             "model_retries": self.model_retries,
+            "side_queries": self.side_queries,
+            "side_query_tokens": {"input": self.side_input_tokens, "output": self.side_output_tokens},
             "model_latency_ms_p50": _pct(self.model_latency_ms, 50),
             "model_latency_ms_total": round(sum(self.model_latency_ms)),
             "ttft_ms_p50": _pct(self.model_ttft_ms, 50),

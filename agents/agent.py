@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -14,7 +15,7 @@ from typing import Callable, Awaitable, Any
 import anthropic
 import openai
 
-from agents.events import RunRecorder, new_id, summarize_args
+from agents.events import RunRecorder, new_id, redact, summarize_args
 from agents.mcp_client import McpManager
 from agents.pricing import call_cost_usd, get_price
 from agents.snapshots import EditHistory
@@ -110,6 +111,10 @@ MICROCOMPACT_IDLE_S = 5 * 60  # 5 minutes
 
 KEEP_RECENT_RESULTS = 3
 
+# 当前正在执行的工具调用的 span。用 ContextVar 而不是实例字段：每个 asyncio 任务有自己的一份，
+# 并发执行的工具不会互相覆盖；子 agent 派生时读取它作为 parent_span_id。
+_CURRENT_SPAN: contextvars.ContextVar[str | None] = contextvars.ContextVar("moltevo_current_span", default=None)
+
 # 完成后验证
 MAX_VERIFY_RETRIES = 2
 VERIFY_TIMEOUT_MS = 300_000
@@ -191,7 +196,8 @@ class Agent:
         self._trace_id: str | None = trace_parent.get("trace_id")
         self._parent_span_id: str | None = trace_parent.get("parent_span_id")
         self._agent_label: str = trace_parent.get("label") or ("sub" if is_sub_agent else "main")
-        self._current_span_id: str | None = None
+        # 子 agent 里选 a（本会话编辑都自动同意）时，通知父 agent 一起切换。
+        self._parent_accept_all: Callable[[], None] | None = None
         self._call_retries = 0
         self._call_first_token_at: float | None = None
         # 改文件前的快照（/undo）；子 agent 共用，子 agent 的修改同样可以撤销。
@@ -337,16 +343,20 @@ class Agent:
         return self._current_task is not None and not self._current_task.done()
 
     #大模型调用的工厂方法,构建一个用于记忆召回（memory recall）的 sideQuery 可调用对象，兼容anthropic, openai。
-    def _build_side_query(self, *, max_tokens: int = 256):
+    def _build_side_query(self, *, max_tokens: int = 256, purpose: str = "side_query"):
         if self._anthropic_client:
             client = self._anthropic_client
             model = self.model
             async def _sq(system:str, user_message:str)->str:
-
+                started = time.monotonic()
                 resp = await client.messages.create(
                     model=model, max_tokens=max(1, int(max_tokens)), system=system,
                 messages=[{"role": "user", "content": user_message}],
                 )
+                # 侧查询同样要计费并计入预算。
+                self._record_model_call(self._anthropic_usage(resp.usage) if getattr(resp, "usage", None) else None,
+                                        started=started, stop_reason=getattr(resp, "stop_reason", None),
+                                        kind="side", purpose=purpose)
                 text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
                 if not text.strip():
                     block_types = [str(getattr(b, "type", "")) for b in getattr(resp, "content", [])]
@@ -362,6 +372,7 @@ class Agent:
             client = self._openai_client
             model = self.model
             async def _sq_openai(system:str, user_message:str)->str:
+                started = time.monotonic()
                 resp = await client.chat.completions.create(
                     model=model,
                     max_tokens=max(1, int(max_tokens)),
@@ -371,6 +382,9 @@ class Agent:
                     ],
 
                 )
+                self._record_model_call(self._openai_usage(getattr(resp, "usage", None)), started=started,
+                                        stop_reason=resp.choices[0].finish_reason if resp.choices else None,
+                                        kind="side", purpose=purpose)
                 if not resp.choices:
                     logging.warning("side_query returned no OpenAI-compatible choices: model=%s", model)
                     return ""
@@ -489,7 +503,7 @@ class Agent:
             self._aborted = True
         except Exception as e:
             turn_error = f"{type(e).__name__}: {e}"
-            self._recorder.emit("error", where="chat", error=turn_error, **self._trace_fields())
+            self._recorder.emit("error", where="chat", error=redact(turn_error), **self._trace_fields())
             # 模型调用重试用尽等异常照常向上抛，但先把这一轮已有的输入和工具结果存盘。
             if not self.is_sub_agent:
                 self._auto_save()
@@ -603,7 +617,7 @@ class Agent:
     async def _timed_tool_call(self, name: str, inp: dict, span_id: str) -> ToolResult:
         """执行一次工具调用并计时。除取消外不抛异常：异常转成错误结果，避免一个工具拖垮整轮。"""
         started = time.monotonic()
-        previous_span, self._current_span_id = self._current_span_id, span_id
+        span_token = _CURRENT_SPAN.set(span_id)
         try:
             result = await self._execute_tool_call(name, inp)
         except asyncio.CancelledError:
@@ -611,7 +625,7 @@ class Agent:
         except Exception as e:
             result = ToolResult.error(f"Error executing tool: {e}")
         finally:
-            self._current_span_id = previous_span
+            _CURRENT_SPAN.reset(span_token)
         if not isinstance(result, ToolResult):
             result = ToolResult.ok(str(result))
         result.meta.setdefault("duration_ms", (time.monotonic() - started) * 1000)
@@ -656,13 +670,20 @@ class Agent:
                 self._record_tool_outcome(name, False)
                 return ToolResult.error("User denied this action.")
             if answer == "all":
-                self.permission_mode = "acceptEdits"
+                self._accept_all_edits()
                 print_info("File edits will be auto-approved for the rest of this session (acceptEdits mode).")
             if cacheable:
                 self._confirmed_paths.add(message)
             return None
         self._recorder.record_permission(tool=name, decision="allow", **trace)
         return None
+
+    def _accept_all_edits(self) -> None:
+        """用户选了 a：本 agent 和它的所有上级 agent 都切换到 acceptEdits。"""
+        if self.permission_mode == "default":
+            self.permission_mode = "acceptEdits"
+        if self._parent_accept_all:
+            self._parent_accept_all()
 
     @staticmethod
     def _anthropic_tool_result(tool_use_id: str, result: ToolResult) -> dict:
@@ -729,9 +750,9 @@ class Agent:
             return False
         if self.confirm_fn is None:
             return False
-        print_confirmation(summary)
         try:
-            return bool(await self.confirm_fn(summary))
+            # 与工具确认走同一套答案解析：confirm_fn 返回的是用户输入的字符串，不能直接 bool()。
+            return await self._confirm_dangerous(summary) == "yes"
         except Exception:
             return False
 
@@ -808,7 +829,7 @@ class Agent:
         if not messages:
             return
 
-        side_query = self._build_side_query(max_tokens=2200)
+        side_query = self._build_side_query(max_tokens=2200, purpose="skill_evolution")
         if side_query is None:
             return
 
@@ -838,7 +859,7 @@ class Agent:
         hits = list(self._last_retrieved_skill_hits or [])
         if not hits or not assistant_text.strip():
             return
-        side_query = self._build_side_query(max_tokens=700)
+        side_query = self._build_side_query(max_tokens=700, purpose="skill_usage_judge")
         try:
             from .online_skill_evolution import judge_retrieved_skill_usage
             from .skills import record_usage_judgments
@@ -1069,7 +1090,7 @@ class Agent:
         return True
 
     async def _generate_folded_session_memory(self, transcript: str) -> dict[str, Any]:
-        side_query = self._build_side_query(max_tokens=6000)
+        side_query = self._build_side_query(max_tokens=6000, purpose="fold")
         if side_query is None:
             return fallback_folded_memory(transcript)
         try:
@@ -1441,10 +1462,11 @@ class Agent:
             max_cost_usd=self.max_cost_usd,
             recorder=self._recorder,
             edit_history=self._edit_history,
-            trace_parent={"trace_id": self._trace_id, "parent_span_id": self._current_span_id,
+            trace_parent={"trace_id": self._trace_id, "parent_span_id": _CURRENT_SPAN.get(),
                           "label": label},
         )
         sub_agent._confirmed_paths = self._confirmed_paths
+        sub_agent._parent_accept_all = self._accept_all_edits
         return sub_agent
 
     async def _execute_agent_tool(self, inp:dict) -> ToolResult:
@@ -1477,7 +1499,7 @@ class Agent:
         # 这里只启动后台任务，不阻塞当前模型调用流程。
         memory_prefetch:MemoryPrefetch | None = None
         if not self.is_sub_agent:
-            sq = self._build_side_query()
+            sq = self._build_side_query(purpose="memory_select")
             if sq:
                 memory_prefetch = start_memory_prefetch(
                     user_message, sq,
@@ -1756,7 +1778,7 @@ class Agent:
         #预取句柄 MemoryPrefetch
         memory_prefetch: MemoryPrefetch | None = None
         if not self.is_sub_agent:
-            sq = self._build_side_query()
+            sq = self._build_side_query(purpose="memory_select")
             if sq:
                 memory_prefetch = start_memory_prefetch(
                     user_message, sq,
@@ -1800,14 +1822,14 @@ class Agent:
                 stop_spinner()
 
             choice = response.get("choices", [{}])[0] if response.get("choices") else {}
-            if response.get("usage"):
-                u = response["usage"]
+            u = response.get("usage")
+            if u:
                 cached = u.get("cached_tokens", 0) or 0
-                self._record_model_call(
-                    {"input": max(u["prompt_tokens"] - cached, 0), "output": u["completion_tokens"],
-                     "cache_read": cached, "cache_write": 0},
-                    started=started, stop_reason=choice.get("finish_reason"),
-                )
+                usage = {"input": max(u["prompt_tokens"] - cached, 0), "output": u["completion_tokens"],
+                         "cache_read": cached, "cache_write": 0}
+            else:
+                usage = None
+            self._record_model_call(usage, started=started, stop_reason=choice.get("finish_reason"))
 
             message = choice.get("message", {})
 
@@ -1977,13 +1999,25 @@ class Agent:
                     },
                     "finish_reason": finish_reason or "stop",
                 }],
-                "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0},
+                # 有些 OpenAI 兼容服务不支持 stream_options，拿不到用量时如实返回 None。
+                "usage": usage,
             }
 
         return await _with_retry(_do, on_retry=self._note_retry)
 
     def _note_retry(self) -> None:
         self._call_retries += 1
+
+    @staticmethod
+    def _openai_usage(u: Any) -> dict[str, int] | None:
+        """OpenAI 兼容用量对象 → 统一格式；没有用量返回 None。"""
+        if u is None:
+            return None
+        details = getattr(u, "prompt_tokens_details", None)
+        cached = (getattr(details, "cached_tokens", 0) if details else 0) or getattr(u, "prompt_cache_hit_tokens", 0) or 0
+        prompt = getattr(u, "prompt_tokens", 0) or 0
+        return {"input": max(prompt - cached, 0), "output": getattr(u, "completion_tokens", 0) or 0,
+                "cache_read": cached, "cache_write": 0}
 
     @staticmethod
     def _anthropic_usage(u: Any) -> dict[str, int]:
@@ -1995,21 +2029,38 @@ class Agent:
             "cache_write": getattr(u, "cache_creation_input_tokens", 0) or 0,
         }
 
-    def _record_model_call(self, usage: dict[str, int], *, started: float, stop_reason: str | None) -> None:
-        """更新 token 统计、按本次调用的模型价格计费，并写 model_call 事件。"""
+    def _record_model_call(self, usage: dict[str, int] | None, *, started: float, stop_reason: str | None,
+                           kind: str = "main", purpose: str | None = None) -> None:
+        """
+        更新 token 统计、按本次调用的模型价格计费，并写事件。
+        usage 为 None 表示服务没有返回用量：这次调用的费用记为未知，而不是 0。
+        kind="side" 是侧查询（记忆筛选、Skill 抽取、折叠等），只计费，不影响上下文大小统计。
+        """
+        missing = usage is None
+        usage = usage or {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
         prompt_total = usage["input"] + usage["cache_read"] + usage["cache_write"]
-        self.last_api_call_time = time.time()
-        self.total_input_tokens += prompt_total
-        self.total_output_tokens += usage["output"]
-        self.last_input_token_count = prompt_total
-        cost = call_cost_usd(self.model, input_tokens=usage["input"], output_tokens=usage["output"],
-                             cache_read_tokens=usage["cache_read"], cache_write_tokens=usage["cache_write"])
-        ttft = (self._call_first_token_at - started) * 1000 if self._call_first_token_at else None
+        if kind == "main":
+            # 主对话的 token 总数不含侧查询（侧查询单独统计在 recorder 里，费用照常计入）。
+            self.total_input_tokens += prompt_total
+            self.total_output_tokens += usage["output"]
+            self.last_api_call_time = time.time()
+            if not missing:
+                # 拿不到用量时保留上一次的值，否则压缩会以为上下文是空的。
+                self.last_input_token_count = prompt_total
+        cost = None if missing else call_cost_usd(
+            self.model, input_tokens=usage["input"], output_tokens=usage["output"],
+            cache_read_tokens=usage["cache_read"], cache_write_tokens=usage["cache_write"])
+        ttft = (self._call_first_token_at - started) * 1000 if kind == "main" and self._call_first_token_at else None
+        extra = {"usage_missing": True} if missing else {}
+        if purpose:
+            extra["purpose"] = purpose
         self._recorder.record_model_call(
             cost_usd=cost, latency_ms=(time.monotonic() - started) * 1000, ttft_ms=ttft,
-            retries=self._call_retries, cache_read=usage["cache_read"], cache_write=usage["cache_write"],
+            retries=self._call_retries if kind == "main" else 0,
+            cache_read=usage["cache_read"], cache_write=usage["cache_write"],
+            event_type="model_call" if kind == "main" else "side_query",
             model=self.model, input_tokens=usage["input"], output_tokens=usage["output"],
-            stop_reason=stop_reason, **self._trace_fields(),
+            stop_reason=stop_reason, **extra, **self._trace_fields(),
         )
 
     @staticmethod
