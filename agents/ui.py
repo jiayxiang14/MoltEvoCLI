@@ -8,8 +8,9 @@ import time
 
 from rich import box
 from rich.align import Align
-from rich.console import Console
+from rich.console import Console, Group
 from rich.panel import Panel
+from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
@@ -221,11 +222,19 @@ def print_error(msg: str) -> None:
     ))
 
 
-def print_confirmation(command: str) -> None:
+def print_confirmation(command: str, preview: str | None = None) -> None:
+    """确认面板。preview 是修改已有文件时的 unified diff，或新建文件的内容预览。"""
     _ensure_fresh_line()
+    if preview:
+        body = Group(Text(_safe_text(command), style="bold"), Text(""), Syntax(_safe_text(preview), "diff",
+                     theme="ansi_dark", background_color="default", word_wrap=True))
+        title = "[bold #FFC107]Confirm change[/bold #FFC107]"
+    else:
+        body = _safe_text(command)
+        title = "[bold #FFC107]Dangerous command[/bold #FFC107]"
     console.print(Panel(
-        _safe_text(command),
-        title="[bold #FFC107]Dangerous command[/bold #FFC107]",
+        body,
+        title=title,
         border_style="#FFC107",
         box=box.ROUNDED,
         padding=(0, 1),

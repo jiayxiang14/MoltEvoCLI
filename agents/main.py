@@ -61,6 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true", help="Resume last session")
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
+    parser.add_argument("--verify", default=None,
+                        help="Command to run when the agent finishes a turn that changed files (e.g. 'pytest -q')")
     parser.add_argument("--help", "-h", action="store_true", help="Show help")
     return parser.parse_args()
 
@@ -76,6 +78,18 @@ def _resolve_permission_mode(args: argparse.Namespace) -> str:
     if args.dont_ask:
         return "dontAsk"
     return "default"
+
+
+def _load_verify_command() -> str | None:
+    """settings.json 里的 verify_command，项目级覆盖用户级。"""
+    from pathlib import Path
+    from .tools import _load_settings
+    command = None
+    for path in (Path.home() / ".moltevo" / "settings.json", Path.cwd() / ".moltevo" / "settings.json"):
+        value = (_load_settings(path) or {}).get("verify_command")
+        if isinstance(value, str) and value.strip():
+            command = value.strip()
+    return command
 
 
 def _clean_env(value: str | None) -> str | None:
@@ -132,13 +146,15 @@ def _resolve_api_config(cli_api_base: str | None) -> tuple[str | None, str | Non
 async def run_repl(agent: Agent) -> None:
     """Interactive REPL loop."""
 
-    async def confirm_fn(message: str) -> bool:
+    async def confirm_fn(message: str, *, preview: str | None = None, offer_all: bool = False) -> str:
+        # a = 本会话后续的文件修改都自动同意（切换到 acceptEdits）。
+        prompt = "  Allow? (y/n/a = yes to all edits this session): " if offer_all else "  Allow? (y/n): "
         try:
-            answer = input("  Allow? (y/n): ")
+            answer = input(prompt)
             mark_line_start()
-            return answer.lower().startswith("y")
+            return answer
         except EOFError:
-            return False
+            return "n"
 
     agent.set_confirm_fn(confirm_fn)
 
@@ -222,6 +238,14 @@ async def run_repl(agent: Agent) -> None:
             continue
         if inp == "/stats":
             print_stats(agent.get_run_stats())
+            continue
+        if inp == "/undo list":
+            edits = agent.list_edits()
+            print_info("\n".join(edits) if edits else "No edits to undo.")
+            continue
+        if inp in ("/undo", "/undo --force"):
+            ok, message = agent.undo_last_edit(force=inp.endswith("--force"))
+            (print_info if ok else print_warning)(message)
             continue
         if inp == "/compact":
             try:
@@ -360,6 +384,8 @@ Options:
   --resume            Resume the last session
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
+  --verify CMD        Run CMD after a turn that changed files; on failure the agent keeps fixing
+                      (up to 2 retries). Also configurable as "verify_command" in settings.json
   --help, -h          Show this help
 
 REPL commands:
@@ -367,6 +393,7 @@ REPL commands:
   /plan               Toggle plan mode (read-only <-> normal)
   /cost               Show token usage and cost
   /stats              Show tool calls, failure rate, latency and cost for this session
+  /undo               Revert the agent's last file change (/undo list, /undo --force)
   /compact            Manually compact conversation
   /memory             List saved memories
   /skills             List available skills
@@ -413,6 +440,7 @@ Examples:
         thinking=args.thinking,
         max_cost_usd=args.max_cost,
         max_turns=args.max_turns,
+        verify_command=args.verify or _load_verify_command(),
         api_base=resolved_api_base if resolved_use_openai else None,
         anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
         api_key=resolved_api_key,

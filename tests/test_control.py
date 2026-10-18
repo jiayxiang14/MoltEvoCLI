@@ -77,7 +77,7 @@ def test_sub_agent_inherits_permission_mode(workdir, mode):
 def test_sub_agent_inherits_connection_confirm_and_recorder(workdir):
     a = make_agent(permission_mode="default")
 
-    async def cf(m):
+    async def cf(m, **kw):
         return True
 
     a.set_confirm_fn(cf)

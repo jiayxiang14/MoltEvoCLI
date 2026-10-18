@@ -17,6 +17,7 @@ import openai
 from agents.events import RunRecorder, new_id, summarize_args
 from agents.mcp_client import McpManager
 from agents.pricing import call_cost_usd, get_price
+from agents.snapshots import EditHistory
 from agents.tool_result import ToolResult
 from agents.memory import MemoryPrefetch, start_memory_prefetch, format_memories_for_injection
 from agents.prompt import build_system_prompt
@@ -32,7 +33,7 @@ from agents.session_memory import (
 from agents.session import save_folded_session_memory, save_session
 from agents.subagent import get_sub_agent_config
 from agents.tools import ToolDef, tool_definitions, execute_tool, CONCURRENCY_SAFE_TOOLS, check_permission, \
-    get_active_tool_definitions
+    get_active_tool_definitions, _run_shell
 from agents.ui import print_info, print_divider, print_assistant_text, print_sub_agent_start, print_sub_agent_end, \
     start_spinner, stop_spinner, print_cost, print_tool_call, print_tool_result, print_confirmation, print_retry, \
     print_error, print_warning
@@ -109,6 +110,11 @@ MICROCOMPACT_IDLE_S = 5 * 60  # 5 minutes
 
 KEEP_RECENT_RESULTS = 3
 
+# 完成后验证
+MAX_VERIFY_RETRIES = 2
+VERIFY_TIMEOUT_MS = 300_000
+VERIFY_FEEDBACK_CHARS = 4000
+
 
 
 def _get_max_output_tokens(model: str) -> int:
@@ -153,7 +159,9 @@ class Agent:
                  is_sub_agent: bool=False,
                  recorder: RunRecorder | None=None,
                  trace_parent: dict[str, Any] | None=None,
-                 events_path: Path | None=None,):
+                 events_path: Path | None=None,
+                 edit_history: EditHistory | None=None,
+                 verify_command: str | None=None,):
         self.permission_mode = permission_mode
         self.thinking = thinking
         self.model = model
@@ -186,6 +194,15 @@ class Agent:
         self._current_span_id: str | None = None
         self._call_retries = 0
         self._call_first_token_at: float | None = None
+        # 改文件前的快照（/undo）；子 agent 共用，子 agent 的修改同样可以撤销。
+        self._edit_history = edit_history or EditHistory(self.session_id)
+        # 下一条用户消息前要附上的系统通知（例如用户撤销了某次修改）。
+        self._pending_notices: list[str] = []
+        # 完成后验证：本轮改过文件才跑，失败时把输出交还模型，最多重试 MAX_VERIFY_RETRIES 次。
+        self.verify_command = verify_command
+        self._turn_commit_mark = 0
+        self._verify_attempts = 0
+        self._verify_failed = False
         if recorder is None and not is_sub_agent and get_price(model) is None:
             note = "费用将显示为未知" + ("，--max-cost 上限无法生效" if max_cost_usd is not None else "")
             print_warning(f"模型 {model} 不在价格表中，{note}。可在 settings.json 的 pricing 字段补充价格。")
@@ -448,6 +465,13 @@ class Agent:
                 original_user_message
             )
 
+        if self._pending_notices and not self.is_sub_agent:
+            user_message = "\n".join(self._pending_notices) + "\n\n" + user_message
+            self._pending_notices = []
+        self._turn_commit_mark = self._edit_history.commits
+        self._verify_attempts = 0
+        self._verify_failed = False
+
         self._aborted = False
         self._turn_output_buffer = []
         if not self._parent_span_id:
@@ -619,16 +643,23 @@ class Agent:
             self._recorder.record_permission(tool=name, decision="deny", reason=message, **trace)
             return ToolResult.error(f"Action denied: {message}")
         if perm["action"] == "confirm" and message:
-            if message in self._confirmed_paths:
+            # 修改已有文件的确认每次都问（内容不同），其余同一条提示确认一次后本会话不再问。
+            cacheable = perm.get("cacheable", True)
+            if cacheable and message in self._confirmed_paths:
                 self._recorder.record_permission(tool=name, decision="allow_cached", reason=message, **trace)
                 return None
-            confirmed = await self._confirm_dangerous(message)
-            self._recorder.record_permission(
-                tool=name, decision="user_approved" if confirmed else "user_denied", reason=message, **trace)
-            if not confirmed:
+            answer = await self._confirm_dangerous(message, preview=perm.get("preview"),
+                                                   offer_all=perm.get("offer_all", False))
+            decision = {"yes": "user_approved", "all": "user_approved_all", "no": "user_denied"}[answer]
+            self._recorder.record_permission(tool=name, decision=decision, reason=message, **trace)
+            if answer == "no":
                 self._record_tool_outcome(name, False)
                 return ToolResult.error("User denied this action.")
-            self._confirmed_paths.add(message)
+            if answer == "all":
+                self.permission_mode = "acceptEdits"
+                print_info("File edits will be auto-approved for the rest of this session (acceptEdits mode).")
+            if cacheable:
+                self._confirmed_paths.add(message)
             return None
         self._recorder.record_permission(tool=name, decision="allow", **trace)
         return None
@@ -1249,7 +1280,7 @@ class Agent:
             # Route MCP tool calls to the MCP manager
         if self._mcp_manager.is_mcp_tool(name):
             return await self._mcp_manager.call_tool(name, inp)
-        result = await execute_tool(name, inp, self._read_file_state)
+        result = await execute_tool(name, inp, self._read_file_state, self._edit_history)
         if name in {"skill_create", "skill_evolve"} and not result.is_error:
             self._refresh_runtime_system_prompt()
         return result
@@ -1409,6 +1440,7 @@ class Agent:
             confirm_fn=self.confirm_fn,
             max_cost_usd=self.max_cost_usd,
             recorder=self._recorder,
+            edit_history=self._edit_history,
             trace_parent={"trace_id": self._trace_id, "parent_span_id": self._current_span_id,
                           "label": label},
         )
@@ -1537,8 +1569,12 @@ class Agent:
                 "content": [self._block_to_dict(b) for b in response.content],
             })
 
-            # 没有工具调用，说明模型已经给出最终回复，本轮对话结束。
+            # 没有工具调用，说明模型已经给出最终回复；配置了验证命令且本轮改过文件时先验证。
             if not tool_uses:
+                feedback = await self._maybe_verify()
+                if feedback:
+                    self._anthropic_messages.append({"role": "user", "content": feedback})
+                    continue
                 if not self.is_sub_agent:
                     print_cost(self.total_input_tokens, self.total_output_tokens, self._format_cost())
                 break
@@ -1780,6 +1816,10 @@ class Agent:
             tool_calls = message.get("tool_calls")
 
             if not tool_calls:
+                feedback = await self._maybe_verify()
+                if feedback:
+                    self._openai_messages.append({"role": "user", "content": feedback})
+                    continue
                 if not self.is_sub_agent:
                     print_cost(self.total_input_tokens, self.total_output_tokens, self._format_cost())
                 break
@@ -1995,13 +2035,79 @@ class Agent:
                                 "content": "[tool error] Tool execution was interrupted before it produced a result."})
         return out
 
-    async def _confirm_dangerous(self, command: str) -> bool:
-        print_confirmation(command)
+    async def _confirm_dangerous(self, command: str, *, preview: str | None = None,
+                                 offer_all: bool = False) -> str:
+        """询问用户。返回 "yes" / "no" / "all"（all 仅在 offer_all 时有效：本会话后续编辑自动同意）。"""
+        print_confirmation(command, preview=preview)
         if self.confirm_fn:
-            return await self.confirm_fn(command)
-        # Fallback: blocking input
-        try:
-            answer = input("  Allow? (y/n): ")
-            return answer.lower().startswith("y")
-        except EOFError:
-            return False
+            answer = await self.confirm_fn(command, preview=preview, offer_all=offer_all)
+        else:
+            # Fallback: blocking input
+            try:
+                answer = input("  Allow? (y/n/a): " if offer_all else "  Allow? (y/n): ")
+            except EOFError:
+                answer = "n"
+        if answer is True or answer is False:
+            return "yes" if answer else "no"
+        answer = str(answer).strip().lower()
+        if offer_all and answer.startswith("a"):
+            return "all"
+        return "yes" if answer.startswith("y") else "no"
+
+    # ── /undo ────────────────────────────────────────────
+    def undo_last_edit(self, *, force: bool = False) -> tuple[bool, str]:
+        ok, message, path = self._edit_history.undo(force=force)
+        if ok and path is not None:
+            # 让模型重新读文件，并明确告诉它发生了什么，否则它会基于自己改过的内容继续编辑。
+            self._read_file_state.pop(str(path), None)
+            self._pending_notices.append(
+                f"[System note: the user ran /undo and reverted your last change to {path}. "
+                f"Re-read the file before editing it again.]")
+        self._recorder.emit("undo", ok=ok, forced=force, path=str(path) if path else None)
+        return ok, message
+
+    def list_edits(self) -> list[str]:
+        return [f"#{r.seq} {r.tool} {r.path}" + ("" if r.existed else " (new file)")
+                for r in self._edit_history.records()]
+
+    # ── 完成后验证 ────────────────────────────────────────
+    async def _maybe_verify(self) -> str | None:
+        """
+        模型准备结束本轮时调用。本轮改过文件且配置了验证命令才运行。
+        返回 None 表示可以结束；返回字符串表示验证失败，应作为用户消息交还模型继续修。
+        """
+        if not self.verify_command or self.is_sub_agent:
+            return None
+        if self._edit_history.commits == self._turn_commit_mark:
+            if self._verify_failed:
+                print_warning("Verification is still failing and no further file changes were made.")
+                self._verify_failed = False
+            return None
+        self._turn_commit_mark = self._edit_history.commits
+        print_info(f"Running verification: {self.verify_command}")
+        started = time.monotonic()
+        result = await _run_shell({"command": self.verify_command, "timeout": VERIFY_TIMEOUT_MS})
+        self._recorder.emit(
+            "verify", command=summarize_args(self.verify_command), passed=not result.is_error,
+            attempt=self._verify_attempts + 1, exit_code=result.meta.get("exit_code"),
+            timed_out=result.meta.get("timed_out", False),
+            duration_ms=round((time.monotonic() - started) * 1000), **self._trace_fields(),
+        )
+        if not result.is_error:
+            print_info("Verification passed.")
+            self._verify_failed = False
+            return None
+        self._verify_failed = True
+        self._verify_attempts += 1
+        if self._verify_attempts > MAX_VERIFY_RETRIES:
+            print_warning(f"Verification still failing after {MAX_VERIFY_RETRIES} retries; stopping.")
+            self._verify_failed = False
+            return None
+        print_warning(f"Verification failed (retry {self._verify_attempts}/{MAX_VERIFY_RETRIES}); "
+                      f"asking the model to fix it.")
+        return (
+            "[Automatic verification failed]\n"
+            f"Command: {self.verify_command}\n"
+            f"{result.content[-VERIFY_FEEDBACK_CHARS:]}\n\n"
+            "Fix the cause of this failure, then finish. Do not report success until it passes."
+        )

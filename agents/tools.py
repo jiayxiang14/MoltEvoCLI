@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import fnmatch
 import json
 import os
@@ -15,6 +16,7 @@ from pathlib import Path
 from tqdm.utils import IS_WIN
 
 from agents.memory import get_memory_dir
+from agents.snapshots import EditHistory
 from agents.tool_result import ToolResult
 
 ToolDef = dict  # Anthropic tool schema dict
@@ -793,6 +795,17 @@ def check_permission(
     if mode == "acceptEdits" and tool_name in EDIT_TOOLS:
         return {"action": "allow"}
 
+    # 默认模式下修改已有文件也要确认，并展示 diff。每次修改都单独询问（不缓存），
+    # 用户可以选 a 切换到 acceptEdits。dontAsk 模式保持原行为，避免 CI 里所有编辑都被自动拒绝。
+    if mode == "default" and tool_name in ("write_file", "edit_file"):
+        path = _resolve_tool_path(inp.get("file_path", ""), must_exist=False)
+        if path.is_file():
+            preview = _edit_preview(tool_name, inp, path)
+            if preview is not None:
+                verb = "overwrite file" if tool_name == "write_file" else "edit file"
+                return {"action": "confirm", "message": f"{verb}: {inp.get('file_path', '')}",
+                        "preview": preview, "cacheable": False, "offer_all": True}
+
     needs_confirm = False
     confirm_message = ""
 
@@ -815,7 +828,10 @@ def check_permission(
     if needs_confirm:
         if mode == "dontAsk":
             return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {confirm_message}"}
-        return {"action": "confirm", "message": confirm_message}
+        decision = {"action": "confirm", "message": confirm_message}
+        if tool_name == "write_file":
+            decision.update(preview=_new_file_preview(inp.get("content", "")), offer_all=True)
+        return decision
 
     return {"action": "allow"}
 
@@ -829,11 +845,44 @@ def _skill_op_result(result: dict) -> ToolResult:
     return ToolResult.ok(text) if result.get("ok") else ToolResult.error(text)
 
 
+MAX_PREVIEW_LINES = 200
+
+
+def _clip_lines(lines: list[str]) -> str:
+    if len(lines) > MAX_PREVIEW_LINES:
+        lines = lines[:MAX_PREVIEW_LINES] + [f"... ({len(lines) - MAX_PREVIEW_LINES} more lines)"]
+    return "\n".join(lines)
+
+
+def _edit_preview(tool_name: str, inp: dict, path: Path) -> str | None:
+    """模拟这次修改并生成 unified diff。找不到要替换的文本时返回 None（工具执行时会报错，不必询问）。"""
+    try:
+        old = path.read_text(errors="replace")
+    except OSError:
+        return None
+    if tool_name == "write_file":
+        new = inp.get("content", "")
+    else:
+        actual = _find_actual_string(old, inp.get("old_string", ""))
+        if not actual or old.count(inp.get("old_string", "")) > 1:
+            return None
+        new = old.replace(actual, inp.get("new_string", ""), 1)
+    name = inp.get("file_path", str(path))
+    diff = list(difflib.unified_diff(old.splitlines(), new.splitlines(),
+                                     fromfile=f"a/{name}", tofile=f"b/{name}", lineterm=""))
+    return _clip_lines(diff) if diff else "(no changes)"
+
+
+def _new_file_preview(content: str) -> str:
+    return _clip_lines([f"+{line}" for line in content.splitlines()])
+
+
 #----------------执行工具调用-----------------------
 # 'agent' 和 'skill' 这两个工具在 agent.py 中处理，以避免循环依赖。"
 
 async def execute_tool(
-    name: str, inp: dict, read_file_state: dict[str, float] | None = None
+    name: str, inp: dict, read_file_state: dict[str, float] | None = None,
+    edit_history: EditHistory | None = None,
 ) -> ToolResult:
     if name == "read_file":
         # 读大文件可能耗时，放进线程，不阻塞事件循环；读写共享状态的代码留在主线程。
@@ -911,8 +960,20 @@ async def execute_tool(
         # 大目录上的 glob 可能很慢，放进线程。
         result = await asyncio.to_thread(_list_files, inp)
     elif name in ("write_file", "edit_file"):
+        # 写之前存快照，供 /undo 恢复。
+        record = None
+        if edit_history is not None:
+            record = edit_history.before_write(_resolve_tool_path(inp["file_path"], must_exist=False), name)
         # 写操作留在主线程同步执行：很快，而且被取消时不会出现"线程里写完了、模型却不知道"的情况。
         result = (_write_file if name == "write_file" else _edit_file)(inp)
+        if edit_history is not None:
+            if record is None:
+                if not result.is_error:
+                    result.content += "\n(Note: file too large to snapshot; this change cannot be undone with /undo.)"
+            elif result.is_error:
+                edit_history.discard(record)
+            else:
+                edit_history.commit(record)
     else:
         return ToolResult.error(f"Unknown tool: {name}")
     result.content = _truncate_result(result.content)
