@@ -1,0 +1,313 @@
+{
+  "version": 1,
+  "description": "MoltEvo skill A/B and learning-curve suite (deterministic graders).",
+  "skills": {
+    "commit-style": {
+      "description": "Commit message convention for this repository",
+      "when_to_use": "writing a commit message",
+      "instructions": "Commit messages follow Conventional Commits with a scope: `<type>(<scope>): <summary>`, e.g. `feat(calc): add sub`. Types: feat, fix, refactor, docs, test, chore."
+    },
+    "answer-style": {
+      "description": "How to format explanations of code",
+      "when_to_use": "explaining what code does",
+      "instructions": "When explaining code, always end the answer with a final line that starts with `TL;DR:` followed by a one-sentence summary."
+    },
+    "python-docstrings": {
+      "description": "Docstring rules for new Python functions",
+      "when_to_use": "adding or writing Python functions",
+      "instructions": "Every new Python function must have a Google-style docstring with an `Args:` section and a `Returns:` section."
+    },
+    "license-header": {
+      "description": "License header for new source files",
+      "when_to_use": "creating a new Python file or module",
+      "instructions": "Every new Python file must start with the exact first line `# SPDX-License-Identifier: MIT`."
+    },
+    "run-tests": {
+      "description": "How to run this project's tests",
+      "when_to_use": "running the test suite",
+      "instructions": "This project uses a src/ layout. Run tests with `PYTHONPATH=src python -m pytest -q`; plain `pytest` fails with ImportError."
+    },
+    "project-layout": {
+      "description": "Where application modules live",
+      "when_to_use": "adding a new module or Python file",
+      "instructions": "All application modules live under `src/app/`. Never create Python modules in the repository root."
+    },
+    "logging-convention": {
+      "description": "How to report problems in application code",
+      "when_to_use": "adding error handling or diagnostics",
+      "instructions": "Report problems with the project logger: `from app.log import log`, then `log.error(...)` or `log.warning(...)`. Never use print() for diagnostics."
+    },
+    "changelog-policy": {
+      "description": "Changelog rule for code changes",
+      "when_to_use": "changing or adding code",
+      "instructions": "Every code change must add a bullet under `## Unreleased` in CHANGELOG.md describing the change."
+    },
+    "gen-script": {
+      "description": "How to run tools/gen.py",
+      "when_to_use": "running tools/gen.py or generating data.json",
+      "instructions": "tools/gen.py only works with the environment variable GEN_MODE=fast, e.g. `GEN_MODE=fast python tools/gen.py`. Without it, it fails with an unhelpful error."
+    },
+    "timezone-tests": {
+      "description": "Test suite timezone requirement",
+      "when_to_use": "running tests",
+      "instructions": "The test suite must be run with TZ=UTC, e.g. `TZ=UTC python -m pytest -q`."
+    },
+    "slow-tests": {
+      "description": "How to skip slow tests",
+      "when_to_use": "running tests",
+      "instructions": "Some tests are marked slow and take minutes. Run the suite with `python -m pytest -q -m 'not slow'`."
+    },
+    "app-entry": {
+      "description": "How to run the app",
+      "when_to_use": "running the application",
+      "instructions": "Run the app as a module: `python -m app`. Running app/__main__.py directly fails with an import error."
+    }
+  },
+  "tasks": [
+    {
+      "id": "pref-commit-msg",
+      "category": "preference",
+      "skills": [
+        "commit-style"
+      ],
+      "files": {
+        "calc.py": "def add(a, b):\n    return a + b\n"
+      },
+      "prompt": "Add a function `sub(a, b)` to calc.py that returns a - b. Then write the commit message you would use for this change into COMMIT_MSG.txt (do not run git).",
+      "check": {
+        "type": "file_regex",
+        "path": "COMMIT_MSG.txt",
+        "pattern": "^(feat|fix|refactor|docs|test|chore)\\([^)]+\\): \\S"
+      }
+    },
+    {
+      "id": "pref-tldr",
+      "category": "preference",
+      "skills": [
+        "answer-style"
+      ],
+      "files": {
+        "calc.py": "def add(a, b):\n    return a + b\n"
+      },
+      "prompt": "Explain in a few sentences what the function `add` in calc.py does.",
+      "check": {
+        "type": "answer_regex",
+        "pattern": "^\\s*\\**TL;DR:"
+      }
+    },
+    {
+      "id": "pref-docstring",
+      "category": "preference",
+      "skills": [
+        "python-docstrings"
+      ],
+      "files": {
+        "calc.py": "def add(a, b):\n    return a + b\n"
+      },
+      "prompt": "Add a function `mul(a, b)` to calc.py that multiplies two numbers.",
+      "check": {
+        "type": "docstring_contains",
+        "path": "calc.py",
+        "function": "mul",
+        "contains": "Args:"
+      }
+    },
+    {
+      "id": "pref-spdx",
+      "category": "preference",
+      "skills": [
+        "license-header"
+      ],
+      "files": {
+        "README.md": "# utils\n"
+      },
+      "prompt": "Create a new module strutil.py with a function `slugify(text)` that lowercases text and replaces spaces with hyphens.",
+      "check": {
+        "type": "file_regex",
+        "path": "strutil.py",
+        "pattern": "\\A# SPDX-License-Identifier: MIT"
+      }
+    },
+    {
+      "id": "conv-test-count",
+      "category": "convention",
+      "skills": [
+        "run-tests"
+      ],
+      "files": {
+        "src/app/__init__.py": "",
+        "src/app/mathx.py": "def double(x):\n    return 2 * x\n",
+        "tests/test_mathx.py": "from app.mathx import double\n\n\ndef test_one():\n    assert double(1) == 2\n\n\ndef test_zero():\n    assert double(0) == 0\n\n\ndef test_neg():\n    assert double(-2) == -4\n"
+      },
+      "prompt": "Run this project's test suite and write the number of passing tests (just the number) into RESULT.txt. Do not modify any source or test files.",
+      "check": {
+        "type": "file_regex",
+        "path": "RESULT.txt",
+        "pattern": "\\A\\s*3\\s*\\Z"
+      }
+    },
+    {
+      "id": "conv-module-location",
+      "category": "convention",
+      "skills": [
+        "project-layout"
+      ],
+      "files": {
+        "src/app/__init__.py": "",
+        "README.md": "# app\n"
+      },
+      "prompt": "Add a new module with a function `parse_date(s)` that parses 'YYYY-MM-DD' strings into datetime.date objects.",
+      "check": {
+        "type": "glob_regex",
+        "glob": "src/app/*.py",
+        "pattern": "def parse_date"
+      }
+    },
+    {
+      "id": "conv-logging",
+      "category": "convention",
+      "skills": [
+        "logging-convention"
+      ],
+      "files": {
+        "src/app/__init__.py": "",
+        "src/app/log.py": "import logging\n\nlog = logging.getLogger('app')\n",
+        "src/app/config.py": "def load_config(path):\n    with open(path) as f:\n        return f.read()\n"
+      },
+      "prompt": "Make load_config in src/app/config.py handle a missing file: report the problem and return an empty string instead of crashing.",
+      "check": {
+        "type": "all",
+        "checks": [
+          {
+            "type": "file_regex",
+            "path": "src/app/config.py",
+            "pattern": "log\\.(error|warning|exception)\\("
+          },
+          {
+            "type": "file_not_regex",
+            "path": "src/app/config.py",
+            "pattern": "\\bprint\\("
+          }
+        ]
+      }
+    },
+    {
+      "id": "conv-changelog",
+      "category": "convention",
+      "skills": [
+        "changelog-policy"
+      ],
+      "files": {
+        "calc.py": "def add(a, b):\n    return a + b\n",
+        "CHANGELOG.md": "# Changelog\n\n## Unreleased\n\n## 1.0.0\n- Initial release\n"
+      },
+      "prompt": "Add a function `neg(a)` to calc.py that returns -a.",
+      "check": {
+        "type": "file_regex",
+        "path": "CHANGELOG.md",
+        "pattern": "## Unreleased\\s*\\n(?:\\s*\\n)*[-*] \\S"
+      }
+    },
+    {
+      "id": "fail-gen-env",
+      "category": "failure-lesson",
+      "skills": [
+        "gen-script"
+      ],
+      "files": {
+        "tools/gen.py": "import json, os, sys\n\nif os.environ.get('GEN_MODE') != 'fast':\n    print('error: initialization failed (code 3)')\n    sys.exit(3)\nwith open('data.json', 'w') as f:\n    json.dump({'ok': True}, f)\n"
+      },
+      "prompt": "Run tools/gen.py to generate data.json. Do not modify tools/gen.py.",
+      "check": {
+        "type": "file_regex",
+        "path": "data.json",
+        "pattern": "\"ok\": true"
+      }
+    },
+    {
+      "id": "fail-tz",
+      "category": "failure-lesson",
+      "skills": [
+        "timezone-tests"
+      ],
+      "files": {
+        "tests/test_time.py": "import time\n\n\ndef test_epoch_hour():\n    assert time.strftime('%H', time.localtime(0)) == '00'\n"
+      },
+      "prompt": "Find how to run the test suite in tests/ so that it passes without modifying any files, then write the exact command you used into RESULT.txt.",
+      "check": {
+        "type": "file_regex",
+        "path": "RESULT.txt",
+        "pattern": "TZ=UTC"
+      }
+    },
+    {
+      "id": "fail-slow-marker",
+      "category": "failure-lesson",
+      "skills": [
+        "slow-tests"
+      ],
+      "files": {
+        "pytest.ini": "[pytest]\nmarkers =\n    slow: takes minutes\n",
+        "tests/test_a.py": "import time\nimport pytest\n\n\ndef test_fast_one():\n    assert True\n\n\ndef test_fast_two():\n    assert 1 + 1 == 2\n\n\n@pytest.mark.slow\ndef test_slow():\n    time.sleep(120)\n"
+      },
+      "prompt": "Run the quick tests of this project (it should take well under a minute) and write the number of passed tests into RESULT.txt. Do not modify any files.",
+      "check": {
+        "type": "file_regex",
+        "path": "RESULT.txt",
+        "pattern": "\\A\\s*2\\s*\\Z"
+      }
+    },
+    {
+      "id": "fail-module-entry",
+      "category": "failure-lesson",
+      "skills": [
+        "app-entry"
+      ],
+      "files": {
+        "app/__init__.py": "",
+        "app/__main__.py": "from .core import run\n\nrun()\n",
+        "app/core.py": "def run():\n    with open('out.txt', 'w') as f:\n        f.write('done')\n"
+      },
+      "prompt": "Run the app so that it produces out.txt. Do not modify any files.",
+      "check": {
+        "type": "file_regex",
+        "path": "out.txt",
+        "pattern": "done"
+      }
+    }
+  ],
+  "learning": [
+    {
+      "test_task": "pref-commit-msg",
+      "teaching_turns": [
+        "Add a function `div(a, b)` to calc.py and write the commit message for it into COMMIT_MSG.txt (do not run git).",
+        "以后写提交信息请一律用 Conventional Commits 格式并带 scope，例如 feat(calc): add div。请按这个格式重写 COMMIT_MSG.txt。",
+        "好的，谢谢。"
+      ]
+    },
+    {
+      "test_task": "pref-tldr",
+      "teaching_turns": [
+        "Explain what calc.py does.",
+        "以后解释代码时，回答的最后一行都要以 TL;DR: 开头，给一句话总结。请按这个要求重新回答。",
+        "好的，谢谢。"
+      ]
+    },
+    {
+      "test_task": "pref-docstring",
+      "teaching_turns": [
+        "Add a function `square(x)` to calc.py.",
+        "以后新写的 Python 函数都要有 Google 风格的 docstring，包含 Args: 和 Returns: 两节。请补上。",
+        "好的，谢谢。"
+      ]
+    },
+    {
+      "test_task": "pref-spdx",
+      "teaching_turns": [
+        "Create a module textutil.py with a function `shout(text)` that returns text.upper().",
+        "以后新建的 Python 文件第一行都要是 # SPDX-License-Identifier: MIT。请补上。",
+        "好的，谢谢。"
+      ]
+    }
+  ]
+}

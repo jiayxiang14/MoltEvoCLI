@@ -226,3 +226,6 @@ test_providers.py
 # Internal analysis artifacts (not learning material)
 analysis/
 analysis_progress.md
+
+# skill A/B experiment outputs
+data/skill_ab/runs/
