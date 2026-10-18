@@ -9,6 +9,7 @@ import os
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Awaitable, Any
 
@@ -20,7 +21,7 @@ from agents.mcp_client import McpManager
 from agents.pricing import call_cost_usd, get_price
 from agents.snapshots import EditHistory
 from agents.tool_result import ToolResult
-from agents.memory import MemoryPrefetch, start_memory_prefetch, format_memories_for_injection
+from agents.memory import MemoryPrefetch, start_memory_prefetch, format_memories_for_injection, get_memory_dir
 from agents.prompt import build_system_prompt
 from agents.session_memory import (
     FOLD_SESSION_MEMORY_SYSTEM,
@@ -569,21 +570,30 @@ class Agent:
             print_assistant_text(text)
 
     def _build_fold_guidance_section(self) -> str:
+        """
+        运行时折叠提示（上下文用量、连续出错次数等）。这些数字每次请求都可能变，
+        所以不放进系统提示词（会让系统提示词之后的缓存全部失效），而是在请求时临时附在最后一条消息末尾。
+        """
         if self._custom_system_prompt is not None:
             return ""
         utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0.0
         last_fold = "never" if not self._fold_last_time else f"{int((time.time() - self._fold_last_time) / 60)}m ago"
         return (
-            "\n\n# Runtime Fold Guidance\n"
+            "<system-reminder>\n# Runtime Fold Guidance\n"
             f"- Current context utilization: {utilization:.0%}\n"
             f"- Recent tool error streak: {self._tool_error_streak}\n"
             f"- Same tool repeat count: {self._same_tool_repeat_count}\n"
             f"- Last fold: {last_fold}\n"
             "- If the context is getting long, the same tool is being retried without progress, or tool failures are accumulating, call `compact_context` before trying more tools.\n"
             "- If you folded very recently and the next step is clear, prefer continuing rather than folding again.\n"
+            "</system-reminder>"
         )
 
     def _refresh_runtime_system_prompt(self) -> None:
+        """
+        重建系统提示词。为了让提示词缓存生效，系统提示词必须稳定：只在会话开始、Skill/记忆变化、
+        压缩、切换 plan 模式时调用，不在每轮工具执行后调用（其中的 git 状态是重建时的快照）。
+        """
         if self._custom_system_prompt is not None:
             return
         self._base_system_prompt = build_system_prompt()
@@ -591,7 +601,6 @@ class Agent:
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
         else:
             self._system_prompt = self._base_system_prompt
-        self._system_prompt += self._build_fold_guidance_section()
         if self.use_openai and self._openai_messages:
             self._openai_messages[0]["content"] = self._system_prompt
 
@@ -654,7 +663,18 @@ class Agent:
             **meta, **self._trace_fields(span_id),
         )
         result.content = content
+        if name in ("write_file", "edit_file") and not result.is_error and self._writes_memory(inp):
+            # 记忆索引是系统提示词的一部分；系统提示词不再每轮重建，所以写记忆后单独刷新。
+            self._refresh_runtime_system_prompt()
         return result
+
+    @staticmethod
+    def _writes_memory(inp: dict) -> bool:
+        try:
+            target = Path(str(inp.get("file_path", ""))).expanduser().resolve()
+            return target.is_relative_to(get_memory_dir().resolve())
+        except (OSError, ValueError):
+            return False
 
     async def _authorize_tool(self, name: str, inp: dict, span_id: str) -> ToolResult | None:
         """权限判定 + 必要时询问用户。返回 None 表示放行，否则返回交给模型的拒绝结果。"""
@@ -1514,14 +1534,22 @@ class Agent:
 
 #--------------Anthropic 后端---------------
     async def  _chat_anthropic(self, user_message: str) -> None:
-        self._anthropic_messages = self._normalize_anthropic_messages(_sanitize_for_utf8(self._anthropic_messages))
+        await self._run_turn(_AnthropicAdapter(self), user_message)
+
+    async def _chat_openai(self, user_message: str) -> None:
+        await self._run_turn(_OpenAIAdapter(self), user_message)
+
+    #--------------统一的主循环：协议相关的部分交给适配器---------------
+    async def _run_turn(self, p: "_ProviderAdapter", user_message: str) -> None:
+        # 上一轮被打断时可能留下不完整的消息（没有结果的工具调用），先修复。
+        p.normalize()
         user_message = _safe_utf8_text(user_message)
-        # 先把本轮用户输入放入 Anthropic 消息历史，后续每轮模型调用都会带上这段上下文。
-        self._anthropic_messages.append({"role": "user", "content": user_message})
+        # 先把本轮用户输入放入消息历史，后续每轮模型调用都会带上这段上下文。
+        p.append_user(user_message)
 
         # 异步内存预取：主 agent 才需要查 memory，sub agent 不额外注入记忆。
         # 这里只启动后台任务，不阻塞当前模型调用流程。
-        memory_prefetch:MemoryPrefetch | None = None
+        memory_prefetch: MemoryPrefetch | None = None
         if not self.is_sub_agent:
             sq = self._build_side_query(purpose="memory_select")
             if sq:
@@ -1537,162 +1565,143 @@ class Agent:
             # 每轮调用模型前尝试压缩上下文，避免消息历史过长。
             self._run_compression_pipeline()
 
-            # 如果记忆预取任务已经完成，就把取回来的 memory 内容追加到最后一条用户消息里。
-            # consumed 用来保证同一批 memory 只注入一次。
+            # 记忆预取完成后，把取回来的 memory 追加到最后一条用户消息里；consumed 保证只注入一次。
             if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
                 memory_prefetch.consumed = True
                 try:
                     memories = memory_prefetch.task.result()
                     if memories:
-                        injection_text = format_memories_for_injection(memories)
-                        injection_text = _safe_utf8_text(injection_text)
-                        last = self._anthropic_messages[-1] if self._anthropic_messages else None
-                        if last and last.get("role") == "user":
-                            content = last.get("content", "")
-                            if isinstance(content, str):
-                                # 字符串不可变，需要重新赋值回 message。
-                                last["content"] = content + "\n\n" + injection_text
-                            elif isinstance(content, list):
-                                # list 是可变对象，append 会直接修改 last["content"] 指向的列表。
-                                content.append({"type": "text", "text": injection_text})
-                        else:
-                            # 如果最后一条不是 user message，就单独追加一条用户消息承载 memory。
-                            self._anthropic_messages.append({"role": "user", "content": injection_text})
-
+                        p.inject_into_last_user(_safe_utf8_text(format_memories_for_injection(memories)))
                         for m in memories:
-                            # 记录本 session 已经注入过的 memory，后续检索时可避免重复 surfaced。
+                            # 记录本 session 已经注入过的 memory，后续检索时可避免重复。
                             self._already_surfaced_memories.add(m.path)
                             self._session_memory_bytes += m.size
-                except:
+                except Exception:
                     # memory 注入失败不应该中断主对话流程。
                     pass
 
             if not self.is_sub_agent:
                 start_spinner()
 
-
             # 上一次迭代因 context_break 等提前退出时，可能留下没被等待的提前执行任务。
             await self._cancel_inflight_tool_tasks()
-            # 保存“提前执行”的工具任务。key 是 Anthropic 返回的 tool_use block id。
+            # 流式阶段提前启动的工具任务。key 是工具调用 id。
             early_executions: dict[str, asyncio.Task] = {}
-
-
             early_spans: dict[str, str] = {}
 
-            def _on_tool_block(block:dict):
-                # 流式响应中一旦完整收到 tool_use block，如果工具是并发安全且权限允许，
-                # 就可以提前开始执行，减少等待完整模型响应后的空档时间。
+            def _on_tool_block(block: dict):
+                # 流式响应中一旦完整收到一个工具调用，如果工具是并发安全且权限允许，
+                # 就提前开始执行，减少等待完整模型响应后的空档时间。
                 if block["name"] in CONCURRENCY_SAFE_TOOLS:
                     perm = check_permission(block["name"], block["input"], self.permission_mode, self._plan_file_path)
-                    if perm["action"]=="allow":
+                    if perm["action"] == "allow":
                         span_id = new_id()
                         self._recorder.record_permission(tool=block["name"], decision="allow", early=True,
                                                          **self._trace_fields(span_id))
-                        task =asyncio.create_task(self._timed_tool_call(block["name"], block["input"], span_id))
+                        task = asyncio.create_task(self._timed_tool_call(block["name"], block["input"], span_id))
                         early_executions[block["id"]] = task
                         early_spans[block["id"]] = span_id
                         self._inflight_tool_tasks.add(task)
                         task.add_done_callback(self._inflight_tool_tasks.discard)
 
-
-            # 调用 Anthropic 流式接口；流式过程中完成 tool block 时会触发 _on_tool_block。
             started = time.monotonic()
             self._call_retries = 0
-            response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
+            turn = await p.call_model(_on_tool_block)
             if not self.is_sub_agent:
                 stop_spinner()
 
             # 记录本次模型调用的耗时、token、缓存命中和费用，用于成本展示与预算控制。
-            self._record_model_call(self._anthropic_usage(response.usage), started=started,
-                                    stop_reason=getattr(response, "stop_reason", None))
-
-            # Anthropic 的响应内容里可能混有 text block 和 tool_use block，这里只挑出工具调用。
-            tool_uses = [b for b in response.content if b.type == "tool_use"]
-
-            # 把模型返回的所有 content block 写入消息历史，后续 tool_result 要与这些 tool_use 对应。
-            self._anthropic_messages.append({
-                "role": "assistant",
-                "content": [self._block_to_dict(b) for b in response.content],
-            })
+            self._record_model_call(turn.usage, started=started, stop_reason=turn.stop_reason)
 
             # 没有工具调用，说明模型已经给出最终回复；配置了验证命令且本轮改过文件时先验证。
-            if not tool_uses:
+            if not turn.tool_calls:
                 feedback = await self._maybe_verify()
                 if feedback:
-                    self._anthropic_messages.append({"role": "user", "content": feedback})
+                    p.append_user(feedback)
                     continue
                 if not self.is_sub_agent:
                     print_cost(self.total_input_tokens, self.total_output_tokens, self._format_cost())
                 break
 
-            # 有工具调用时，进入下一轮工具执行。这里同时检查 turn/budget 限制。
+            # 有工具调用时，进入工具执行。这里同时检查 turn/budget 限制。
             self.current_turns += 1
             budget = self._check_budget()
             if budget["exceeded"]:
                 print_info(f"Budget exceeded: {budget['reason']}")
-                self._anthropic_messages.append({
-                    "role": "user",
-                    "content": [
-                        self._anthropic_tool_result(tu.id, ToolResult.error(f"Tool execution skipped: {budget['reason']}"))
-                        for tu in tool_uses
-                    ],
-                })
+                # 每个工具调用都要有对应的结果，否则下一次请求会因为消息不完整被拒绝。
+                p.append_tool_results([(c, ToolResult.error(f"Tool execution skipped: {budget['reason']}"))
+                                       for c in turn.tool_calls])
                 break
 
-
-            # 收集本轮所有工具结果，之后作为 tool_result 消息回传给模型。
-            tool_results: list[dict] = []
-            context_break = False
-
-            for tu in tool_uses:
-                # context_break 表示某个工具执行期间清理了上下文，需要停止继续处理本轮剩余工具。
-                if context_break or self._aborted:
-                    break
-
-                # 将工具入参转为普通 dict，便于权限检查、打印和实际执行。
-                inp = dict(tu.input) if hasattr(tu, "items") else tu.input
-                print_tool_call(tu.name, inp)
-
-                # 如果这个工具已经在流式阶段提前开始执行，这里只需要等待它完成并收集结果。
-                early_task = early_executions.get(tu.id)
-                if early_task:
-                    span_id = early_spans[tu.id]
-                    result = self._finish_tool_call(tu.name, inp, await early_task, span_id=span_id, early=True)
-                    tool_results.append(self._anthropic_tool_result(tu.id, result))
-                    continue
-
-                # 如果不是提前执行的工具，就在真正执行前做权限检查（拒绝时也要回一个 tool_result）。
-                span_id = new_id()
-                denial = await self._authorize_tool(tu.name, inp, span_id)
-                if denial is not None:
-                    tool_results.append(self._anthropic_tool_result(tu.id, denial))
-                    continue
-
-                # 权限通过后执行工具，并把大输出持久化为可回传的摘要或引用。
-                result = await self._timed_tool_call(tu.name, inp, span_id)
-                result = self._finish_tool_call(tu.name, inp, result, span_id=span_id)
-
-                if self._context_cleared:
-                    # 工具执行过程中如果清理了上下文，就把结果作为新的用户消息写入，
-                    # 并停止继续处理本轮剩余工具，避免旧上下文和新上下文混在一起。
-                    self._context_cleared = False
-                    self._anthropic_messages.append({"role": "user", "content": result.content})
-                    context_break = True
-                    break
-
-                # Anthropic 要求 tool_result 使用 tool_use_id 对应到前面的 tool_use block。
-                tool_results.append(self._anthropic_tool_result(tu.id, result))
-
-            if not context_break and tool_results:
-                # Anthropic 要求 assistant/tool_use 后面紧跟一条 user/tool_result 消息，
-                # 且这条消息必须包含本轮所有 tool_use 的对应结果。
-                self._anthropic_messages.append({"role": "user", "content": tool_results})
+            results, cleared_result = await self._execute_tool_calls(turn.tool_calls, early_executions, early_spans)
+            if cleared_result is not None:
+                # 工具执行过程中清理了上下文（折叠、清空后执行计划），把结果作为新的用户消息写入。
+                p.append_user(cleared_result.content)
+            else:
+                p.append_tool_results(results)
+                # 中断等情况下没拿到结果的调用补一条错误结果，保证消息完整。
+                p.after_tool_round()
 
             self._context_cleared = False
-
             # 工具结果可能很长，每轮工具执行后检查是否需要压缩上下文。
-            self._refresh_runtime_system_prompt()
             await self._check_and_compact()
+
+    async def _execute_tool_calls(self, calls: list["ToolCall"], early_executions: dict[str, asyncio.Task],
+                                  early_spans: dict[str, str]) -> tuple[list[tuple["ToolCall", ToolResult]], ToolResult | None]:
+        """
+        执行一轮工具调用。返回 (按原顺序的 (调用, 结果) 列表, 清空上下文的那次结果或 None)。
+        - 流式阶段已提前执行的，等它完成；
+        - 相邻的只读工具合成一批并发执行（只读工具不会弹确认）；
+        - 其余按顺序逐个"判定权限 → 执行"，确认弹窗一个接一个出现。
+        """
+        pairs: list[tuple[ToolCall, ToolResult]] = []
+        i = 0
+        while i < len(calls) and not self._aborted:
+            call = calls[i]
+            if call.id in early_executions:
+                print_tool_call(call.name, call.input)
+                result = self._finish_tool_call(call.name, call.input, await early_executions[call.id],
+                                                span_id=early_spans[call.id], early=True)
+                pairs.append((call, result))
+                i += 1
+                continue
+
+            if call.name in CONCURRENCY_SAFE_TOOLS:
+                group: list[ToolCall] = []
+                while (i < len(calls) and calls[i].name in CONCURRENCY_SAFE_TOOLS
+                       and calls[i].id not in early_executions):
+                    group.append(calls[i])
+                    i += 1
+                planned = []
+                for g in group:
+                    print_tool_call(g.name, g.input)
+                    span_id = new_id()
+                    planned.append((g, span_id, await self._authorize_tool(g.name, g.input, span_id)))
+                runnable = [(g, span_id) for g, span_id, denial in planned if denial is None]
+                # _timed_tool_call 不抛异常（取消除外），一个工具出错不会拖垮同批的其他工具。
+                outcomes = await asyncio.gather(*[self._timed_tool_call(g.name, g.input, span_id)
+                                                  for g, span_id in runnable])
+                finished = {g.id: self._finish_tool_call(g.name, g.input, r, span_id=span_id)
+                            for (g, span_id), r in zip(runnable, outcomes)}
+                pairs += [(g, denial if denial is not None else finished[g.id]) for g, _, denial in planned]
+                continue
+
+            print_tool_call(call.name, call.input)
+            span_id = new_id()
+            i += 1
+            denial = await self._authorize_tool(call.name, call.input, span_id)
+            if denial is not None:
+                pairs.append((call, denial))
+                continue
+            result = self._finish_tool_call(call.name, call.input,
+                                            await self._timed_tool_call(call.name, call.input, span_id),
+                                            span_id=span_id)
+            if self._context_cleared:
+                # 上下文已被清空（之前的结果也随之作废），停止处理本轮剩余工具。
+                self._context_cleared = False
+                return pairs, result
+            pairs.append((call, result))
+        return pairs, None
 
     @staticmethod
     def _block_to_dict(block) -> dict:
@@ -1712,9 +1721,7 @@ class Agent:
             create_params: dict[str, Any] = {
                 "model": self.model,
                 "max_tokens": max_output if self._thinking_mode != "disabled" else 16384,
-                "system": _safe_utf8_text(self._system_prompt),
-                "tools": _sanitize_for_utf8(get_active_tool_definitions(self.tools)),
-                "messages": _sanitize_for_utf8(self._anthropic_messages),
+                **self._build_anthropic_request(),
             }
             #如果开启了思考模式，就给 Anthropic 请求加上 thinking 参数。
             if self._thinking_mode  in ("adaptive", "enabled"):
@@ -1791,169 +1798,12 @@ class Agent:
 #调用 _do()，如果遇到可重试错误，就由 _with_retry() 负责重试。
         return await _with_retry(_do, on_retry=self._note_retry)
 
-    #openAI后端
-
-    async def _chat_openai(self, user_message:str) -> None:
-        # 上一轮被 Ctrl+C 打断时可能留下没有结果的 tool_call，先补齐。
-        self._openai_messages = self._normalize_openai_messages(self._openai_messages)
-        user_message = _safe_utf8_text(user_message)
-        self._openai_messages.append({"role": "user", "content": user_message})
-
-        #预取句柄 MemoryPrefetch
-        memory_prefetch: MemoryPrefetch | None = None
-        if not self.is_sub_agent:
-            sq = self._build_side_query(purpose="memory_select")
-            if sq:
-                memory_prefetch = start_memory_prefetch(
-                    user_message, sq,
-                    self._already_surfaced_memories, self._session_memory_bytes,
-                )
-
-        while True:
-            if self._aborted:
-                break
-
-            self._run_compression_pipeline()
-
-            if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
-                memory_prefetch.consumed = True
-                try:
-                    memories = memory_prefetch.task.result()
-                    if memories:
-                        injection_text = format_memories_for_injection(memories)
-                        injection_text = _safe_utf8_text(injection_text)
-                        last = self._openai_messages[-1] if self._openai_messages else None
-
-                        if last and last.get("role") == "user":
-                            last["content"] = (last.get("content") or "") + "\n\n" + injection_text
-                        else:
-                            self._openai_messages.append({"role": "user", "content": injection_text})
-
-                        for m in memories:
-                            self._already_surfaced_memories.add(m.path)
-                            self._session_memory_bytes += len(m.content.encode())
-                except Exception:
-                    pass
-
-            if not self.is_sub_agent:
-                start_spinner()
-
-            started = time.monotonic()
-            self._call_retries = 0
-            response = await self._call_openai_stream()
-
-            if not self.is_sub_agent:
-                stop_spinner()
-
-            choice = response.get("choices", [{}])[0] if response.get("choices") else {}
-            u = response.get("usage")
-            if u:
-                cached = u.get("cached_tokens", 0) or 0
-                usage = {"input": max(u["prompt_tokens"] - cached, 0), "output": u["completion_tokens"],
-                         "cache_read": cached, "cache_write": 0}
-            else:
-                usage = None
-            self._record_model_call(usage, started=started, stop_reason=choice.get("finish_reason"))
-
-            message = choice.get("message", {})
-
-            self._openai_messages.append(message)
-
-            tool_calls = message.get("tool_calls")
-
-            if not tool_calls:
-                feedback = await self._maybe_verify()
-                if feedback:
-                    self._openai_messages.append({"role": "user", "content": feedback})
-                    continue
-                if not self.is_sub_agent:
-                    print_cost(self.total_input_tokens, self.total_output_tokens, self._format_cost())
-                break
-
-            self.current_turns += 1
-            budget = self._check_budget()
-            if budget["exceeded"]:
-                print_info(f"Budget exceeded: {budget['reason']}")
-                # OpenAI 要求每个 tool_call 都有对应的 tool 消息，否则下一次请求会被拒绝。
-                for tc in tool_calls:
-                    self._openai_messages.append(self._openai_tool_message(
-                        tc["id"], ToolResult.error(f"Tool execution skipped: {budget['reason']}")))
-                break
-
-            # 1) 先对所有工具调用逐个做权限判定（每个调用只判定一次）。
-            oai_checked: list[dict] = []
-            for tc in tool_calls:
-                if self._aborted:
-                    break
-
-                if tc.get("type") != "function":
-                    continue
-
-                fn_name = tc["function"]["name"]
-                try:
-                    inp = json.loads(tc["function"]["arguments"])
-                except Exception:
-                    inp = {}
-
-                print_tool_call(fn_name, inp)
-                span_id = new_id()
-                denial = await self._authorize_tool(fn_name, inp, span_id)
-                oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "span": span_id, "denial": denial})
-
-            # 2) 相邻的、已放行的只读工具合成一批并发执行，其余按顺序执行。
-            #    （原实现把这段写在上面的循环里，多个工具调用时会把前面的调用重复执行。）
-            oai_batches: list[dict] = []
-            for ct in oai_checked:
-                safe = ct["denial"] is None and ct["fn"] in CONCURRENCY_SAFE_TOOLS
-                if safe and oai_batches and oai_batches[-1]["concurrent"]:
-                    oai_batches[-1]["items"].append(ct)
-                else:
-                    oai_batches.append({"concurrent": safe, "items": [ct]})
-
-            oai_context_break = False
-            for batch in oai_batches:
-                if oai_context_break or self._aborted:
-                    break
-
-                if batch["concurrent"]:
-                    # _timed_tool_call 不抛异常（取消除外），一个工具出错不会拖垮同批的其他工具。
-                    results = await asyncio.gather(
-                        *[self._timed_tool_call(ct["fn"], ct["inp"], ct["span"]) for ct in batch["items"]])
-                    for ct, res in zip(batch["items"], results):
-                        res = self._finish_tool_call(ct["fn"], ct["inp"], res, span_id=ct["span"])
-                        self._openai_messages.append(self._openai_tool_message(ct["tc"]["id"], res))
-                    continue
-
-                for ct in batch["items"]:
-                    if ct["denial"] is not None:
-                        self._openai_messages.append(self._openai_tool_message(ct["tc"]["id"], ct["denial"]))
-                        continue
-
-                    res = await self._timed_tool_call(ct["fn"], ct["inp"], ct["span"])
-                    res = self._finish_tool_call(ct["fn"], ct["inp"], res, span_id=ct["span"])
-
-                    if self._context_cleared:
-                        self._context_cleared = False
-                        self._openai_messages.append({"role": "user", "content": res.content})
-                        oai_context_break = True
-                        break
-
-                    self._openai_messages.append(self._openai_tool_message(ct["tc"]["id"], res))
-
-            # 3) 中断等情况下没拿到结果的调用补一条错误结果，保证消息完整。
-            if not oai_context_break:
-                self._openai_messages = self._normalize_openai_messages(self._openai_messages)
-
-            self._context_cleared = False
-            self._refresh_runtime_system_prompt()
-            await self._check_and_compact()
-
     async def _call_openai_stream(self) -> dict:
         async def _do():
             stream = await self._openai_client.chat.completions.create(
                 model=self.model,
                 tools=_sanitize_for_utf8(_to_openai_tools(get_active_tool_definitions(self.tools))),
-                messages=_sanitize_for_utf8(self._openai_messages),
+                messages=self._build_openai_request_messages(),
                 stream=True,
                 stream_options={"include_usage": True},
             )
@@ -2028,6 +1878,50 @@ class Agent:
             }
 
         return await _with_retry(_do, on_retry=self._note_retry)
+
+    # ── 请求构造：稳定前缀 + 缓存断点 + 每次请求临时附加的运行时提示 ───────────
+    def _prompt_caching_enabled(self) -> bool:
+        # 只对 claude 模型默认加 cache_control：第三方 Anthropic 兼容接口不一定认这个字段。
+        # DeepSeek / OpenAI 有自动前缀缓存，不需要断点，只要前缀稳定就能命中。
+        flag = os.environ.get("MOLTEVO_PROMPT_CACHE", "").strip().lower()
+        if flag in {"1", "true", "yes", "on"}:
+            return True
+        if flag in {"0", "false", "no", "off"}:
+            return False
+        return self.model.lower().startswith("claude")
+
+    def _build_anthropic_request(self) -> dict[str, Any]:
+        """系统提示词、工具定义、最后一条消息各打一个缓存断点；运行时提示附在断点之后，不进入缓存也不写进历史。"""
+        cache = self._prompt_caching_enabled()
+        marker = {"type": "ephemeral"}
+        system: Any = _safe_utf8_text(self._system_prompt)
+        tools = _sanitize_for_utf8(get_active_tool_definitions(self.tools))
+        messages = _sanitize_for_utf8(self._anthropic_messages)   # 返回的是新对象，修改不影响历史
+        if cache:
+            system = [{"type": "text", "text": system, "cache_control": marker}]
+            if tools:
+                tools = [*tools[:-1], {**tools[-1], "cache_control": marker}]
+        guidance = self._build_fold_guidance_section()
+        if messages and (cache or guidance):
+            last = dict(messages[-1])
+            content = last.get("content")
+            blocks = [{"type": "text", "text": content}] if isinstance(content, str) else [dict(b) for b in content or []]
+            if cache and blocks:
+                blocks[-1] = {**blocks[-1], "cache_control": marker}
+            if guidance:
+                blocks.append({"type": "text", "text": guidance})
+            last["content"] = blocks
+            messages = [*messages[:-1], last]
+        return {"system": system, "tools": tools, "messages": messages}
+
+    def _build_openai_request_messages(self) -> list:
+        """运行时提示附在最后一条消息末尾（只改请求副本），保持前面的前缀不变，便于自动前缀缓存命中。"""
+        messages = _sanitize_for_utf8(self._openai_messages)
+        guidance = self._build_fold_guidance_section()
+        if guidance and messages and isinstance(messages[-1], dict) and isinstance(messages[-1].get("content"), str) \
+                and messages[-1].get("role") in ("user", "tool"):
+            messages = [*messages[:-1], {**messages[-1], "content": messages[-1]["content"] + "\n\n" + guidance}]
+        return messages
 
     def _note_retry(self) -> None:
         self._call_retries += 1
@@ -2255,3 +2149,124 @@ class Agent:
             f"{result.content[-VERIFY_FEEDBACK_CHARS:]}\n\n"
             "Fix the cause of this failure, then finish. Do not report success until it passes."
         )
+
+
+# ─── 协议适配器：主循环里和协议有关的部分 ─────────────────────────────────
+# 消息仍按各协议的原生格式存放（存档、压缩、折叠、回退都直接操作它们），
+# 适配器只负责：修复消息、追加用户消息、注入记忆、调用模型并转成统一的工具调用、写回工具结果。
+
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    input: dict
+
+
+@dataclass
+class ModelTurn:
+    tool_calls: list[ToolCall]
+    usage: dict[str, int] | None
+    stop_reason: str | None
+
+
+class _ProviderAdapter:
+    def __init__(self, agent: Agent):
+        self.agent = agent
+
+    def normalize(self) -> None: ...
+    def append_user(self, text: str) -> None: ...
+    def inject_into_last_user(self, text: str) -> None: ...
+    async def call_model(self, on_tool_block) -> ModelTurn: ...
+    def append_tool_results(self, pairs: list[tuple[ToolCall, ToolResult]]) -> None: ...
+
+    def after_tool_round(self) -> None:
+        pass
+
+
+class _AnthropicAdapter(_ProviderAdapter):
+    def normalize(self) -> None:
+        a = self.agent
+        a._anthropic_messages = a._normalize_anthropic_messages(_sanitize_for_utf8(a._anthropic_messages))
+
+    def append_user(self, text: str) -> None:
+        self.agent._anthropic_messages.append({"role": "user", "content": text})
+
+    def inject_into_last_user(self, text: str) -> None:
+        messages = self.agent._anthropic_messages
+        last = messages[-1] if messages else None
+        if last and last.get("role") == "user":
+            content = last.get("content", "")
+            if isinstance(content, str):
+                last["content"] = content + "\n\n" + text
+            elif isinstance(content, list):
+                content.append({"type": "text", "text": text})
+        else:
+            # 最后一条不是 user message 时，单独追加一条用户消息承载 memory。
+            messages.append({"role": "user", "content": text})
+
+    async def call_model(self, on_tool_block) -> ModelTurn:
+        a = self.agent
+        response = await a._call_anthropic_stream(on_tool_block_complete=on_tool_block)
+        # 把模型返回的所有 content block 写入历史，后续 tool_result 要与这些 tool_use 对应。
+        a._anthropic_messages.append({"role": "assistant",
+                                      "content": [a._block_to_dict(b) for b in response.content]})
+        calls = [ToolCall(b.id, b.name, dict(b.input) if hasattr(b.input, "items") else b.input)
+                 for b in response.content if b.type == "tool_use"]
+        return ModelTurn(calls, a._anthropic_usage(response.usage), getattr(response, "stop_reason", None))
+
+    def append_tool_results(self, pairs: list[tuple[ToolCall, ToolResult]]) -> None:
+        # Anthropic 要求 assistant/tool_use 后面紧跟一条包含全部 tool_result 的 user 消息；
+        # 中断时缺的结果由下一轮开头的 normalize 补齐。
+        if pairs:
+            self.agent._anthropic_messages.append(
+                {"role": "user", "content": [self.agent._anthropic_tool_result(c.id, r) for c, r in pairs]})
+
+
+class _OpenAIAdapter(_ProviderAdapter):
+    def normalize(self) -> None:
+        a = self.agent
+        a._openai_messages = a._normalize_openai_messages(a._openai_messages)
+
+    def append_user(self, text: str) -> None:
+        self.agent._openai_messages.append({"role": "user", "content": text})
+
+    def inject_into_last_user(self, text: str) -> None:
+        messages = self.agent._openai_messages
+        last = messages[-1] if messages else None
+        if last and last.get("role") == "user":
+            last["content"] = (last.get("content") or "") + "\n\n" + text
+        else:
+            messages.append({"role": "user", "content": text})
+
+    async def call_model(self, on_tool_block) -> ModelTurn:
+        a = self.agent
+        response = await a._call_openai_stream()
+        choice = response.get("choices", [{}])[0] if response.get("choices") else {}
+        message = choice.get("message", {})
+        a._openai_messages.append(message)
+        calls = []
+        for tc in message.get("tool_calls") or []:
+            if tc.get("type") != "function":
+                # 不支持的调用类型也照常走执行流程，得到 "Unknown tool" 错误结果，模型看到后可以继续。
+                calls.append(ToolCall(tc.get("id", ""), f"unsupported:{tc.get('type')}", {}))
+                continue
+            try:
+                args = json.loads(tc["function"]["arguments"])
+            except Exception:
+                args = {}
+            calls.append(ToolCall(tc["id"], tc["function"]["name"], args))
+        u = response.get("usage")
+        usage = None
+        if u:
+            cached = u.get("cached_tokens", 0) or 0
+            usage = {"input": max(u["prompt_tokens"] - cached, 0), "output": u["completion_tokens"],
+                     "cache_read": cached, "cache_write": 0}
+        return ModelTurn(calls, usage, choice.get("finish_reason"))
+
+    def append_tool_results(self, pairs: list[tuple[ToolCall, ToolResult]]) -> None:
+        for c, r in pairs:
+            self.agent._openai_messages.append(self.agent._openai_tool_message(c.id, r))
+
+    def after_tool_round(self) -> None:
+        a = self.agent
+        a._openai_messages = a._normalize_openai_messages(a._openai_messages)
