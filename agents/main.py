@@ -169,12 +169,14 @@ async def run_repl(agent: Agent) -> None:
     agent.set_plan_approval_fn(plan_approval_fn)
 
     sigint_count = 0
+    loop = asyncio.get_running_loop()
 
     def handle_sigint(sig, frame):
         nonlocal sigint_count
-        if agent._aborted is False and agent._output_buffer is not None:
-            # Agent is processing
-            agent.abort()
+        if agent.is_processing and not agent._aborted:
+            # 信号可能在事件循环执行中途到达，取消任务交给事件循环在安全点执行。
+            # 不用 loop.add_signal_handler：等待 input() 时事件循环不运行，空闲时的 Ctrl+C 会失效。
+            loop.call_soon_threadsafe(agent.abort)
             print_interrupted()
             sigint_count = 0
             print_user_prompt()

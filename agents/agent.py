@@ -151,6 +151,10 @@ class Agent:
         self.model = model
         self.use_openai = bool(api_base)
         self.is_sub_agent = is_sub_agent
+        # 保留连接配置，派生子 agent 时原样继承。
+        self._api_base = api_base
+        self._anthropic_base_url = anthropic_base_url
+        self._api_key = api_key
         self.tools = custom_tools or tool_definitions
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
@@ -352,8 +356,17 @@ class Agent:
     def set_confirm_fn(self, fn:Callable[[str], Awaitable[bool]]) -> None:
         self.confirm_fn = fn
 
-    def set_plan_approval_fn(self, fn:Callable[[str], Awaitable[bool]]) -> None:
+    def set_plan_approval_fn(self, fn:Callable[[str], Awaitable[dict]]) -> None:
         self._plan_approval_fn = fn
+
+    def _leave_plan_mode(self, target_mode: str) -> None:
+        """离开计划模式的唯一出口：切换权限模式、清理计划文件路径、恢复系统提示词。"""
+        self.permission_mode = target_mode
+        self._pre_plan_mode = None
+        self._plan_file_path = None
+        self._system_prompt = self._base_system_prompt
+        if self.use_openai and self._openai_messages:
+            self._openai_messages[0]["content"] = self._system_prompt
 
 
     #计划模式开关（“状态切换与现场保护”机制）
@@ -375,12 +388,7 @@ class Agent:
        反馈与返回：打印进入提示（包含计划文件的路径），并返回 "plan"。
         """
         if self.permission_mode == "plan":
-            self.permission_mode = self._pre_plan_mode or "default"
-            self._pre_plan_mode = None
-            self._plan_file_path = None
-            self._system_prompt = self._base_system_prompt
-            if self.use_openai and self._openai_messages:
-                self._openai_messages[0]["content"] =self._system_prompt
+            self._leave_plan_mode(self._pre_plan_mode or "default")
             print_info(f"Exited plan mode -> {self.permission_mode} mode")
             return self.permission_mode
         else:
@@ -426,7 +434,11 @@ class Agent:
             await self._current_task
         except asyncio.CancelledError:
             self._aborted = True
-
+        except Exception:
+            # 模型调用重试用尽等异常照常向上抛，但先把这一轮已有的输入和工具结果存盘。
+            if not self.is_sub_agent:
+                self._auto_save()
+            raise
         finally:
             self._current_task = None
         assistant_text = "".join(self._turn_output_buffer or []).strip()
@@ -1149,14 +1161,7 @@ class Agent:
             )
 
             print_sub_agent_start("skill-fork", inp.get("skill_name", ""))
-            sub_agent = Agent(
-                model=self.model,
-                api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
-                custom_system_prompt=result["prompt"],
-                custom_tools=tools,
-                is_sub_agent=True,
-                permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
-            )
+            sub_agent = self._spawn_sub_agent(result["prompt"], tools)
             try:
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
                 self.total_input_tokens += sub_result["tokens"]["input"]
@@ -1186,10 +1191,10 @@ class Agent:
                 return "Not in plan mode."
             plan_content = "(No plan file found)"
             if self._plan_file_path and Path(self._plan_file_path).exists():
-                plan_content = self._plan_file_path
+                plan_content = Path(self._plan_file_path).read_text(encoding="utf-8")
             # 交互式审批流程（如果有审批函数）
             if self._plan_approval_fn:
-                result = self._plan_approval_fn(plan_content)
+                result = await self._plan_approval_fn(plan_content)
                 choice = result.get("choice", "manual-execute")
 
                 if choice =="keep-planning":
@@ -1208,13 +1213,8 @@ class Agent:
                     target_mode = self._pre_plan_mode or "default"
 
                 #离开计划模式
-                self._pre_plan_mode = target_mode
-                self._pre_plan_mode = None
                 saved_plan_path = self._plan_file_path
-                self._plan_file_path = None
-                self._system_prompt = self._base_system_prompt
-                if self.use_openai and self._openai_messages:
-                    self._openai_messages[0]["content"] = self._system_prompt
+                self._leave_plan_mode(target_mode)
 
                 if choice == "clear-and-execute":
                     self._clear_history_keep_system()
@@ -1233,12 +1233,7 @@ class Agent:
                     f"Proceed with implementation."
                 )
             # 没有审批函数时的回退（例如子代理）
-            self.permission_mode = self._pre_plan_mode or "default"
-            self._pre_plan_mode = None
-            self._plan_file_path = None
-            self._system_prompt = self._base_system_prompt
-            if self.use_openai and self._openai_messages:
-                self._openai_messages[0]["content"] = self._system_prompt
+            self._leave_plan_mode(self._pre_plan_mode or "default")
 
             print_info("Exited plan mode. Restored to " + self.permission_mode + " mode.")
             return f"Exited plan mode. Permission mode restored to: {self.permission_mode}\n\n## Your Plan:\n{plan_content}"
@@ -1258,6 +1253,27 @@ class Agent:
         self._same_tool_repeat_count = 0
         self._last_tool_name = ""
 
+    def _spawn_sub_agent(self, system_prompt: str, tools: list[ToolDef]) -> "Agent":
+        """
+        派生子 agent 的唯一入口。
+        - 连接配置（协议、地址、密钥、模型）原样继承，否则子 agent 会连到 SDK 默认地址。
+        - 权限模式继承父 agent：派出去的 agent 不能比派它的 agent 权限更大。
+        - 共用确认函数和已确认集合，主 agent 批过的操作不重复询问。
+        """
+        sub_agent = Agent(
+            model=self.model,
+            api_base=self._api_base,
+            anthropic_base_url=self._anthropic_base_url,
+            api_key=self._api_key,
+            custom_system_prompt=system_prompt,
+            custom_tools=tools,
+            is_sub_agent=True,
+            permission_mode=self.permission_mode,
+            confirm_fn=self.confirm_fn,
+        )
+        sub_agent._confirmed_paths = self._confirmed_paths
+        return sub_agent
+
     async def _execute_agent_tool(self, inp:dict) -> str:
         agent_type = inp.get("type", "general")
         description = inp.get("description", "sub-agent task")
@@ -1266,14 +1282,7 @@ class Agent:
 
         config = get_sub_agent_config(agent_type)
 
-        sub_agent = Agent(
-            model=self.model,
-            api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
-            custom_system_prompt=config["system_prompt"],
-            custom_tools=config["tools"],
-            is_sub_agent=True,
-            permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
-        )
+        sub_agent = self._spawn_sub_agent(config["system_prompt"], config["tools"])
         try:
             result = await sub_agent.run_once(prompt)
             self.total_input_tokens += result["tokens"]["input"]
