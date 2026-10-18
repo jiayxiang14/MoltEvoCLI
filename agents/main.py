@@ -26,6 +26,7 @@ from .ui import (
     print_warning,
     print_stats,
     print_checkpoints,
+    print_doctor,
     mark_line_start,
 )
 from .session import load_session, get_latest_session_id, find_session_id
@@ -63,6 +64,8 @@ def parse_args() -> argparse.Namespace:
                         help="Resume the latest session in this project, or the given session id")
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
+    parser.add_argument("--doctor", action="store_true",
+                        help="Check API key, base URL, model name, pricing, tools and MCP servers, then exit")
     parser.add_argument("--verify", default=None,
                         help="Command to run when the agent finishes a turn that changed files (e.g. 'pytest -q')")
     parser.add_argument("--help", "-h", action="store_true", help="Show help")
@@ -424,6 +427,7 @@ Options:
   --resume [ID]       Resume the latest session in this directory, or a specific session id
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
+  --doctor            Check API key, base URL, model name, pricing, tools and MCP servers
   --verify CMD        Run CMD after a turn that changed files; on failure the agent keeps fixing
                       (up to 2 retries). Also configurable as "verify_command" in settings.json
   --help, -h          Show this help
@@ -487,6 +491,17 @@ Examples:
         anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
         api_key=resolved_api_key,
     )
+
+    from .doctor import exit_code, local_checks, remote_checks
+    if args.doctor:
+        # 完整自检：本地检查 + 一个 max_tokens=1 的最小请求 + 逐个连接 MCP 服务。
+        checks = local_checks(model) + asyncio.run(remote_checks(agent))
+        print_doctor(checks)
+        sys.exit(exit_code(checks))
+    # 启动时只做不花钱的本地检查，有问题才提示。
+    for check in local_checks(model):
+        if check.status != "ok" and check.name != "price known":   # 价格未知已在创建 Agent 时提示过
+            print_warning(f"{check.name}: {check.detail}" + (f" ({check.fix})" if check.fix else ""))
 
     # Resume session
     # --resume 会加载最近一次会话，把历史消息恢复到新建的 Agent 中。

@@ -258,6 +258,22 @@ def print_cost(input_tokens: int, output_tokens: int, cost: str) -> None:
     console.print(Panel(table, title="Cost", border_style="cyan", box=box.ROUNDED))
 
 
+def print_doctor(checks: list) -> None:
+    """moltevo --doctor 的结果：逐项 通过 / 警告 / 失败，附修复建议。"""
+    _ensure_fresh_line()
+    marks = {"ok": "[green]✓ ok[/green]", "warn": "[#FFC107]! warn[/#FFC107]", "fail": "[red]✗ fail[/red]"}
+    table = Table(box=box.SIMPLE, show_edge=False, pad_edge=False)
+    table.add_column("check", style="cyan")
+    table.add_column("status")
+    table.add_column("detail")
+    table.add_column("fix", style="dim")
+    for c in checks:
+        table.add_row(_safe_text(c.name), marks.get(c.status, c.status), _safe_text(c.detail), _safe_text(c.fix))
+    failed = sum(c.status == "fail" for c in checks)
+    title = "Doctor: all checks passed" if not failed else f"Doctor: {failed} check(s) failed"
+    console.print(Panel(table, title=title, border_style="red" if failed else "cyan", box=box.ROUNDED))
+
+
 def print_checkpoints(checkpoints: list[dict]) -> None:
     """/rewind 的列表：每轮的开头、之后改过几处文件、是否跑过 shell、对话能否回退。"""
     _ensure_fresh_line()
