@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable, Awaitable, Any
 
 import anthropic
+import httpx
 import openai
 
 from agents.events import RunRecorder, new_id, redact, summarize_args
@@ -45,14 +46,32 @@ from agents.ui import print_info, print_divider, print_assistant_text, print_sub
 # 指数退避重试
 
 
+# 请求本身有问题的错误，重试也不会成功（参照 anthropics/claude-quickstarts 的 computer-use loop）。
+_UNRECOVERABLE_ERRORS = (
+    anthropic.BadRequestError, anthropic.AuthenticationError, anthropic.PermissionDeniedError,
+    anthropic.NotFoundError, anthropic.UnprocessableEntityError,
+    openai.BadRequestError, openai.AuthenticationError, openai.PermissionDeniedError,
+    openai.NotFoundError, openai.UnprocessableEntityError,
+)
+# 限流、连接断开、超时（APITimeoutError 是 APIConnectionError 的子类）。
+_RECOVERABLE_ERRORS = (
+    anthropic.RateLimitError, anthropic.APIConnectionError,
+    openai.RateLimitError, openai.APIConnectionError,
+    httpx.TransportError,          # 流式读取中途断开等，SDK 不一定会包装
+)
+
+
 def _is_retryable(error: Exception) -> bool:
+    """按异常类型判断：限流、连接问题、5xx 重试；参数、认证、权限、模型不存在等直接放弃。"""
+    if isinstance(error, _UNRECOVERABLE_ERRORS):
+        return False
+    if isinstance(error, _RECOVERABLE_ERRORS):
+        return True
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
-    if status in (429, 503, 529):
+    if isinstance(status, int) and (status in (408, 409, 429) or 500 <= status < 600):
         return True
-    msg = str(error)
-    if "overloaded" in msg or "ECONNRESET" in msg or "ETIMEDOUT" in msg:
-        return True
-    return False
+    msg = str(error).lower()
+    return any(s in msg for s in ("overloaded", "econnreset", "etimedout", "connection reset"))
 
 
 def _safe_utf8_text(value: object) -> str:
@@ -112,10 +131,16 @@ SNIPPABLE_TOOLS = {"read_file", "grep_search", "list_files", "run_shell"}
 MICROCOMPACT_IDLE_S = 5 * 60  # 5 minutes
 
 KEEP_RECENT_RESULTS = 3
+# 按区间裁剪：未裁剪的结果攒到 KEEP_RECENT_RESULTS + SNIP_INTERVAL 条才一次性裁回 KEEP_RECENT_RESULTS 条。
+# 每轮都多裁一条会让请求前缀每轮都变、缓存每轮都失效；按区间裁剪每 SNIP_INTERVAL 条结果才改写一次前缀。
+SNIP_INTERVAL = 8
 
 # 当前正在执行的工具调用的 span。用 ContextVar 而不是实例字段：每个 asyncio 任务有自己的一份，
 # 并发执行的工具不会互相覆盖；子 agent 派生时读取它作为 parent_span_id。
 _CURRENT_SPAN: contextvars.ContextVar[str | None] = contextvars.ContextVar("moltevo_current_span", default=None)
+
+# 模型连续返回空内容时，最多提示它继续的次数
+MAX_EMPTY_RETRIES = 2
 
 # 完成后验证
 MAX_VERIFY_RETRIES = 2
@@ -1270,7 +1295,7 @@ class Agent:
                     if tool_info and tool_info["name"] in SNIPPABLE_TOOLS:
                         results.append({"mindex": mindex, "bindex": bindex, "name": tool_info["name"], "file_path": tool_info.get("input", {}).get("file_path")})
 
-        if len(results) <= KEEP_RECENT_RESULTS:
+        if len(results) < KEEP_RECENT_RESULTS + SNIP_INTERVAL:
             return
 
         to_snip =  set()
@@ -1301,7 +1326,7 @@ class Agent:
         for i, msg in enumerate(self._openai_messages):
             if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and msg["content"] != SNIP_PLACEHOLDER:
                 tool_msgs.append(i)
-        if len(tool_msgs) <= KEEP_RECENT_RESULTS:
+        if len(tool_msgs) < KEEP_RECENT_RESULTS + SNIP_INTERVAL:
             return
         snip_count = len(tool_msgs) - KEEP_RECENT_RESULTS
         for i in range(snip_count):
@@ -1609,6 +1634,7 @@ class Agent:
                     user_message, sq,
                     self._already_surfaced_memories, self._session_memory_bytes,
                 )
+        empty_retries = 0
         while True:
             # 外部请求中止时，结束整个 agent loop。
             if self._aborted:
@@ -1665,6 +1691,17 @@ class Agent:
 
             # 记录本次模型调用的耗时、token、缓存命中和费用，用于成本展示与预算控制。
             self._record_model_call(turn.usage, started=started, stop_reason=turn.stop_reason)
+
+            if turn.empty:
+                # 空回复不写进历史（空的助手消息会让下一次请求被拒），提示模型继续；连续多次才放弃。
+                empty_retries += 1
+                self._recorder.emit("empty_response", attempt=empty_retries, **self._trace_fields())
+                if empty_retries > MAX_EMPTY_RETRIES:
+                    print_warning(f"The model returned {empty_retries} empty responses in a row; stopping this turn.")
+                    break
+                p.append_user("Please continue; do not produce an empty response.")
+                continue
+            empty_retries = 0
 
             # 没有工具调用，说明模型已经给出最终回复；配置了验证命令且本轮改过文件时先验证。
             if not turn.tool_calls:
@@ -2232,6 +2269,7 @@ class ModelTurn:
     tool_calls: list[ToolCall]
     usage: dict[str, int] | None
     stop_reason: str | None
+    empty: bool = False         # 既没有文字也没有工具调用：适配器不会把它写进历史
 
 
 class _ProviderAdapter:
@@ -2249,12 +2287,28 @@ class _ProviderAdapter:
 
 
 class _AnthropicAdapter(_ProviderAdapter):
+    # Anthropic 协议要求用户和助手交替出现；相邻的用户消息在第三方兼容接口上可能被拒。
+    STOPPED_PLACEHOLDER = "[previous turn ended here]"
+
     def normalize(self) -> None:
         a = self.agent
         a._anthropic_messages = a._normalize_anthropic_messages(_sanitize_for_utf8(a._anthropic_messages))
+        # 上一轮以用户消息结束（预算超限、中断、/compact 之后）：补一条占位的助手消息再开始新一轮。
+        # 在记录检查点之前补，检查点里的消息条数才对得上。
+        if a._anthropic_messages and a._anthropic_messages[-1].get("role") == "user":
+            a._anthropic_messages.append(
+                {"role": "assistant", "content": [{"type": "text", "text": self.STOPPED_PLACEHOLDER}]})
 
     def append_user(self, text: str) -> None:
-        self.agent._anthropic_messages.append({"role": "user", "content": text})
+        messages = self.agent._anthropic_messages
+        last = messages[-1] if messages else None
+        if last and last.get("role") == "user":
+            # 轮次中途（例如折叠之后、空回复之后）最后一条已是用户消息：合并进去，不追加新的。
+            content = last.get("content")
+            blocks = [{"type": "text", "text": content}] if isinstance(content, str) else list(content or [])
+            last["content"] = blocks + [{"type": "text", "text": text}]
+            return
+        messages.append({"role": "user", "content": text})
 
     def inject_into_last_user(self, text: str) -> None:
         messages = self.agent._anthropic_messages
@@ -2272,12 +2326,15 @@ class _AnthropicAdapter(_ProviderAdapter):
     async def call_model(self, on_tool_block) -> ModelTurn:
         a = self.agent
         response = await a._call_anthropic_stream(on_tool_block_complete=on_tool_block)
+        usage = a._anthropic_usage(response.usage)
+        if not any(b.type == "tool_use" or (b.type == "text" and (b.text or "").strip()) for b in response.content):
+            return ModelTurn([], usage, getattr(response, "stop_reason", None), empty=True)
         # 把模型返回的所有 content block 写入历史，后续 tool_result 要与这些 tool_use 对应。
         a._anthropic_messages.append({"role": "assistant",
                                       "content": [a._block_to_dict(b) for b in response.content]})
         calls = [ToolCall(b.id, b.name, dict(b.input) if hasattr(b.input, "items") else b.input)
                  for b in response.content if b.type == "tool_use"]
-        return ModelTurn(calls, a._anthropic_usage(response.usage), getattr(response, "stop_reason", None))
+        return ModelTurn(calls, usage, getattr(response, "stop_reason", None))
 
     def append_tool_results(self, pairs: list[tuple[ToolCall, ToolResult]]) -> None:
         # Anthropic 要求 assistant/tool_use 后面紧跟一条包含全部 tool_result 的 user 消息；
@@ -2308,6 +2365,14 @@ class _OpenAIAdapter(_ProviderAdapter):
         response = await a._call_openai_stream()
         choice = response.get("choices", [{}])[0] if response.get("choices") else {}
         message = choice.get("message", {})
+        u = response.get("usage")
+        usage = None
+        if u:
+            cached = u.get("cached_tokens", 0) or 0
+            usage = {"input": max(u["prompt_tokens"] - cached, 0), "output": u["completion_tokens"],
+                     "cache_read": cached, "cache_write": 0}
+        if not message.get("tool_calls") and not (message.get("content") or "").strip():
+            return ModelTurn([], usage, choice.get("finish_reason"), empty=True)
         a._openai_messages.append(message)
         calls = []
         for tc in message.get("tool_calls") or []:
@@ -2320,12 +2385,6 @@ class _OpenAIAdapter(_ProviderAdapter):
             except Exception:
                 args = {}
             calls.append(ToolCall(tc["id"], tc["function"]["name"], args))
-        u = response.get("usage")
-        usage = None
-        if u:
-            cached = u.get("cached_tokens", 0) or 0
-            usage = {"input": max(u["prompt_tokens"] - cached, 0), "output": u["completion_tokens"],
-                     "cache_read": cached, "cache_write": 0}
         return ModelTurn(calls, usage, choice.get("finish_reason"))
 
     def append_tool_results(self, pairs: list[tuple[ToolCall, ToolResult]]) -> None:
