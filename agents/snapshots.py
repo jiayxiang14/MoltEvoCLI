@@ -98,6 +98,11 @@ class EditHistory:
         latest: dict[Path, EditRecord] = {}
         for record in pending:
             latest[record.path] = record
+        # 快照文件缺失时无法恢复，force 也不行：整体拒绝，避免回退到一半。
+        missing = [r.path for r in pending if r.existed and not (r.snapshot and r.snapshot.exists())]
+        if missing:
+            names = ", ".join(sorted({str(p) for p in missing}))
+            return False, f"Snapshots are missing for: {names}. Nothing was reverted.", []
         conflicts = [p for p, r in latest.items()
                      if (_hash_file(p) if p.exists() else None) != r.after_hash]
         if conflicts and not force:
@@ -126,13 +131,13 @@ class EditHistory:
         self._seq = int(data.get("seq", 0))
         self.commits = int(data.get("commits", 0))
         self.shell_runs = int(data.get("shell_runs", 0))
+        # 全部保留：检查点按撤销栈长度定位，丢掉任何一条都会让检查点错位。
+        # 快照文件缺失的记录在撤销时会被拒绝并说明原因。
         self._stack = [
             EditRecord(int(r["seq"]), Path(r["path"]), bool(r["existed"]),
                        Path(r["snapshot"]) if r.get("snapshot") else None, r.get("tool", ""),
                        float(r.get("ts", 0)), r.get("after_hash"))
             for r in data.get("records", [])
-            # 快照文件已被清理的记录无法撤销，丢弃。
-            if not r.get("existed") or (r.get("snapshot") and Path(r["snapshot"]).exists())
         ]
 
     def undo(self, *, force: bool = False) -> tuple[bool, str, Path | None]:
@@ -140,6 +145,8 @@ class EditHistory:
         if not self._stack:
             return False, "Nothing to undo.", None
         record = self._stack[-1]
+        if record.existed and not (record.snapshot and record.snapshot.exists()):
+            return False, f"The snapshot for {record.path} is missing; this change can't be undone.", record.path
         current = _hash_file(record.path) if record.path.exists() else None
         if current != record.after_hash and not force:
             return False, (f"{record.path} has changed since the agent wrote it; "

@@ -20,6 +20,7 @@ from agents.events import RunRecorder, new_id, redact, summarize_args
 from agents.mcp_client import McpManager
 from agents.pricing import call_cost_usd, get_price
 from agents.snapshots import EditHistory
+from agents.tool_journal import ToolJournal
 from agents.tool_result import ToolResult
 from agents.memory import MemoryPrefetch, start_memory_prefetch, format_memories_for_injection, get_memory_dir
 from agents.prompt import build_system_prompt
@@ -32,7 +33,7 @@ from agents.session_memory import (
     format_folded_memory,
     parse_folded_memory,
 )
-from agents.session import save_folded_session_memory, save_session
+from agents.session import SESSION_DIR, save_folded_session_memory, save_session
 from agents.subagent import get_sub_agent_config
 from agents.tools import ToolDef, tool_definitions, execute_tool, CONCURRENCY_SAFE_TOOLS, check_permission, \
     get_active_tool_definitions, _run_shell
@@ -216,6 +217,12 @@ class Agent:
         self._checkpoints: list[dict[str, Any]] = []
         self._turn_counter = 0
         self._history_epoch = 0
+        self._turn_preview = ""
+        # 工具调用结果日志（按 tool_call_id）：一轮被打断后据此补结果，避免已执行的操作被重做。
+        # 只有主 agent 的消息会存档和恢复，子 agent 只在内存里记。
+        journal_path = None if is_sub_agent else SESSION_DIR / f"{self.session_id}.journal.jsonl"
+        self._journal = ToolJournal(journal_path)
+        self._journal_files: list[str] = [str(journal_path)] if journal_path else []
         if recorder is None and not is_sub_agent and get_price(model) is None:
             note = "费用将显示为未知" + ("，--max-cost 上限无法生效" if max_cost_usd is not None else "")
             print_warning(f"模型 {model} 不在价格表中，{note}。可在 settings.json 的 pricing 字段补充价格。")
@@ -492,8 +499,7 @@ class Agent:
         self._turn_commit_mark = self._edit_history.commits
         self._verify_attempts = 0
         self._verify_failed = False
-        if not self.is_sub_agent:
-            self._record_checkpoint(original_user_message)
+        self._turn_preview = original_user_message
 
         self._aborted = False
         self._turn_output_buffer = []
@@ -631,8 +637,9 @@ class Agent:
             fields["parent_span_id"] = self._parent_span_id
         return fields
 
-    async def _timed_tool_call(self, name: str, inp: dict, span_id: str) -> ToolResult:
+    async def _timed_tool_call(self, name: str, inp: dict, span_id: str, call_id: str | None = None) -> ToolResult:
         """执行一次工具调用并计时。除取消外不抛异常：异常转成错误结果，避免一个工具拖垮整轮。"""
+        self._journal.started(call_id, name)
         started = time.monotonic()
         span_token = _CURRENT_SPAN.set(span_id)
         try:
@@ -649,7 +656,7 @@ class Agent:
         return result
 
     def _finish_tool_call(self, name: str, inp: dict, result: ToolResult, *, span_id: str,
-                          early: bool = False) -> ToolResult:
+                          early: bool = False, call_id: str | None = None) -> ToolResult:
         """截断或落盘 → 打印 → 记录成败 → 写事件。"""
         if name == "run_shell":
             self._edit_history.note_shell()
@@ -663,6 +670,7 @@ class Agent:
             **meta, **self._trace_fields(span_id),
         )
         result.content = content
+        self._journal.done(call_id, name, result)
         if name in ("write_file", "edit_file") and not result.is_error and self._writes_memory(inp):
             # 记忆索引是系统提示词的一部分；系统提示词不再每轮重建，所以写记忆后单独刷新。
             self._refresh_runtime_system_prompt()
@@ -983,7 +991,8 @@ class Agent:
     #恢复会话信息
     def restore_session(self, data:dict)->None:
         if data.get("anthropicMessages"):
-            self._anthropic_messages = self._normalize_anthropic_messages(_sanitize_for_utf8(data["anthropicMessages"]))
+            # 不在这里修复消息：下一轮开头会在读入结果日志之后再修复，补进去的才是真实结果。
+            self._anthropic_messages = _sanitize_for_utf8(data["anthropicMessages"])
         if data.get("openaiMessages"):
             self._openai_messages = _sanitize_for_utf8(data["openaiMessages"])
         if isinstance(data.get("foldedSessionMemories"), list):
@@ -995,12 +1004,22 @@ class Agent:
             self._history_epoch = int(data.get("historyEpoch", 0))
         if isinstance(data.get("editHistory"), dict):
             self._edit_history.load_dict(data["editHistory"])
+        # 读入之前会话的结果日志（可能是多次 --resume 串起来的），恢复后的修复能用上真实结果。
+        for path in data.get("journalFiles") or []:
+            if path not in self._journal_files:
+                self._journal.load(Path(path))
+                self._journal_files.insert(0, path)
         print_info(f"Session restored ({self._get_message_count()} messages).")
 
 
 
 #整理 Anthropic 的历史消息，修正部分角色错误，并丢弃不合法的工具调用消息。
     def _normalize_anthropic_messages(self, messages: list[dict]) -> list[dict]:
+        """
+        修复消息，保证每个 tool_use 后面紧跟的用户消息里都有它的 tool_result。
+        只"补"不"删"：缺的结果按结果日志补进下一条用户消息（没有就在末尾追加一条），
+        这样不会改变已有消息的位置（检查点按消息条数定位）；找不到对应 tool_use 的孤立结果被去掉。
+        """
         role_normalized = []
         for msg in messages:
             copied = dict(msg)
@@ -1010,26 +1029,52 @@ class Agent:
                     copied["role"] = "assistant"
             role_normalized.append(copied)
 
-        normalized = []
+        normalized: list[dict] = []
         i = 0
         while i < len(role_normalized):
             msg = role_normalized[i]
-            tool_use_ids = self._anthropic_tool_use_ids(msg)
-            if not tool_use_ids:
-                normalized.append(msg)
-                i += 1
-                continue
-
-            next_msg = role_normalized[i + 1] if i + 1 < len(role_normalized) else None
-            result_ids = self._anthropic_tool_result_ids(next_msg) if next_msg else set()
-            if tool_use_ids.issubset(result_ids):
-                normalized.append(msg)
-                normalized.append(next_msg)
-                i += 2
-                continue
-
             i += 1
+            calls = []
+            if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
+                calls = [b for b in msg["content"] if isinstance(b, dict) and b.get("type") == "tool_use"]
+            if msg.get("role") == "user" and (not normalized or not self._anthropic_tool_use_ids(normalized[-1])):
+                msg = self._drop_orphan_results(msg, set())
+            normalized.append(msg)
+            if not calls:
+                continue
+            ids = {b.get("id") for b in calls}
+            nxt = role_normalized[i] if i < len(role_normalized) else None
+            if nxt is not None and nxt.get("role") == "user":
+                nxt = self._drop_orphan_results(nxt, ids)
+                content = nxt.get("content")
+                blocks = [{"type": "text", "text": content}] if isinstance(content, str) else list(content or [])
+                have = self._anthropic_tool_result_ids({"role": "user", "content": blocks})
+                results = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_result"]
+                others = [b for b in blocks if not (isinstance(b, dict) and b.get("type") == "tool_result")]
+                missing = [self._anthropic_tool_result(b["id"], self._journal.resolve(b["id"], b.get("name", "")))
+                           for b in calls if b.get("id") not in have]
+                if missing:
+                    # tool_result 必须排在用户消息的最前面。
+                    nxt = {**nxt, "content": results + missing + others}
+                normalized.append(nxt)
+                i += 1
+            else:
+                normalized.append({"role": "user", "content": [
+                    self._anthropic_tool_result(b["id"], self._journal.resolve(b["id"], b.get("name", "")))
+                    for b in calls]})
         return normalized
+
+    @staticmethod
+    def _drop_orphan_results(msg: dict, valid_ids: set) -> dict:
+        """去掉找不到对应 tool_use 的 tool_result；消息变空时留一段说明文字，保持消息条数不变。"""
+        content = msg.get("content")
+        if not isinstance(content, list):
+            return msg
+        kept = [b for b in content if not (isinstance(b, dict) and b.get("type") == "tool_result"
+                                           and b.get("tool_use_id") not in valid_ids)]
+        if len(kept) == len(content):
+            return msg
+        return {**msg, "content": kept or [{"type": "text", "text": "(orphaned tool results removed)"}]}
 
     @staticmethod
     def _anthropic_tool_use_ids(msg: dict | None) -> set[str]:
@@ -1071,6 +1116,7 @@ class Agent:
                 "turnCounter": self._turn_counter,
                 "historyEpoch": self._history_epoch,
                 "editHistory": self._edit_history.to_dict(),
+                "journalFiles": self._journal_files,
             })
         except Exception:
             pass
@@ -1347,6 +1393,9 @@ class Agent:
         result = await execute_tool(name, inp, self._read_file_state, self._edit_history)
         if name in {"skill_create", "skill_evolve"} and not result.is_error:
             self._refresh_runtime_system_prompt()
+        if name == "tool_search" and not result.is_error and not result.content.startswith("No matching"):
+            # 系统提示词里列着"可按需加载的工具"，激活后刷新一次，避免列表过时。
+            self._refresh_runtime_system_prompt()
         return result
 
     async def _execute_compact_context_tool(self, inp: dict) -> ToolResult:
@@ -1541,8 +1590,11 @@ class Agent:
 
     #--------------统一的主循环：协议相关的部分交给适配器---------------
     async def _run_turn(self, p: "_ProviderAdapter", user_message: str) -> None:
-        # 上一轮被打断时可能留下不完整的消息（没有结果的工具调用），先修复。
+        # 上一轮被打断时可能留下不完整的消息（没有结果的工具调用），先按结果日志补齐。
         p.normalize()
+        # 检查点在修复之后、追加本轮用户消息之前记录，记下的消息条数才对得上。
+        if not self.is_sub_agent:
+            self._record_checkpoint(self._turn_preview)
         user_message = _safe_utf8_text(user_message)
         # 先把本轮用户输入放入消息历史，后续每轮模型调用都会带上这段上下文。
         p.append_user(user_message)
@@ -1598,7 +1650,8 @@ class Agent:
                         span_id = new_id()
                         self._recorder.record_permission(tool=block["name"], decision="allow", early=True,
                                                          **self._trace_fields(span_id))
-                        task = asyncio.create_task(self._timed_tool_call(block["name"], block["input"], span_id))
+                        task = asyncio.create_task(
+                            self._timed_tool_call(block["name"], block["input"], span_id, block["id"]))
                         early_executions[block["id"]] = task
                         early_spans[block["id"]] = span_id
                         self._inflight_tool_tasks.add(task)
@@ -1633,13 +1686,19 @@ class Agent:
                                        for c in turn.tool_calls])
                 break
 
+            if not self.is_sub_agent:
+                # 执行工具前先存档：进程若在执行中崩溃，--resume 后历史里有这些工具调用，
+                # 再按结果日志补上真实结果，模型就不会把已经执行过的操作再做一遍。
+                self._auto_save()
             results, cleared_result = await self._execute_tool_calls(turn.tool_calls, early_executions, early_spans)
             if cleared_result is not None:
                 # 工具执行过程中清理了上下文（折叠、清空后执行计划），把结果作为新的用户消息写入。
                 p.append_user(cleared_result.content)
             else:
+                # 中途被中断时，没执行到的调用也要有结果（按结果日志区分"未开始"和"执行中"），保证消息完整。
+                answered = {c.id for c, _ in results}
+                results += [(c, self._journal.resolve(c.id, c.name)) for c in turn.tool_calls if c.id not in answered]
                 p.append_tool_results(results)
-                # 中断等情况下没拿到结果的调用补一条错误结果，保证消息完整。
                 p.after_tool_round()
 
             self._context_cleared = False
@@ -1661,7 +1720,7 @@ class Agent:
             if call.id in early_executions:
                 print_tool_call(call.name, call.input)
                 result = self._finish_tool_call(call.name, call.input, await early_executions[call.id],
-                                                span_id=early_spans[call.id], early=True)
+                                                span_id=early_spans[call.id], early=True, call_id=call.id)
                 pairs.append((call, result))
                 i += 1
                 continue
@@ -1679,10 +1738,13 @@ class Agent:
                     planned.append((g, span_id, await self._authorize_tool(g.name, g.input, span_id)))
                 runnable = [(g, span_id) for g, span_id, denial in planned if denial is None]
                 # _timed_tool_call 不抛异常（取消除外），一个工具出错不会拖垮同批的其他工具。
-                outcomes = await asyncio.gather(*[self._timed_tool_call(g.name, g.input, span_id)
+                outcomes = await asyncio.gather(*[self._timed_tool_call(g.name, g.input, span_id, g.id)
                                                   for g, span_id in runnable])
-                finished = {g.id: self._finish_tool_call(g.name, g.input, r, span_id=span_id)
+                finished = {g.id: self._finish_tool_call(g.name, g.input, r, span_id=span_id, call_id=g.id)
                             for (g, span_id), r in zip(runnable, outcomes)}
+                for g, _, denial in planned:
+                    if denial is not None:
+                        self._journal.done(g.id, g.name, denial)
                 pairs += [(g, denial if denial is not None else finished[g.id]) for g, _, denial in planned]
                 continue
 
@@ -1691,11 +1753,12 @@ class Agent:
             i += 1
             denial = await self._authorize_tool(call.name, call.input, span_id)
             if denial is not None:
+                self._journal.done(call.id, call.name, denial)
                 pairs.append((call, denial))
                 continue
             result = self._finish_tool_call(call.name, call.input,
-                                            await self._timed_tool_call(call.name, call.input, span_id),
-                                            span_id=span_id)
+                                            await self._timed_tool_call(call.name, call.input, span_id, call.id),
+                                            span_id=span_id, call_id=call.id)
             if self._context_cleared:
                 # 上下文已被清空（之前的结果也随之作废），停止处理本轮剩余工具。
                 self._context_cleared = False
@@ -1982,8 +2045,8 @@ class Agent:
         )
 
     @staticmethod
-    def _normalize_openai_messages(messages: list) -> list:
-        """给没有结果的 tool_call 补一条错误结果：中断或出错后，下一次请求不会因消息不完整被拒绝。"""
+    def _normalize_openai_messages(messages: list, resolve: Callable[[str, str], ToolResult] | None = None) -> list:
+        """给没有结果的 tool_call 补结果（有结果日志时按日志补）：下一次请求不会因消息不完整被拒绝。"""
         out: list = []
         i = 0
         while i < len(messages):
@@ -2000,8 +2063,10 @@ class Agent:
                 i += 1
             for call in calls:
                 if call.get("id") not in answered:
-                    out.append({"role": "tool", "tool_call_id": call.get("id"),
-                                "content": "[tool error] Tool execution was interrupted before it produced a result."})
+                    name = (call.get("function") or {}).get("name", "")
+                    result = resolve(call.get("id"), name) if resolve else \
+                        ToolResult.error("Tool execution was interrupted before it produced a result.")
+                    out.append(Agent._openai_tool_message(call.get("id"), result))
         return out
 
     async def _confirm_dangerous(self, command: str, *, preview: str | None = None,
@@ -2225,7 +2290,7 @@ class _AnthropicAdapter(_ProviderAdapter):
 class _OpenAIAdapter(_ProviderAdapter):
     def normalize(self) -> None:
         a = self.agent
-        a._openai_messages = a._normalize_openai_messages(a._openai_messages)
+        a._openai_messages = a._normalize_openai_messages(a._openai_messages, a._journal.resolve)
 
     def append_user(self, text: str) -> None:
         self.agent._openai_messages.append({"role": "user", "content": text})
@@ -2269,4 +2334,4 @@ class _OpenAIAdapter(_ProviderAdapter):
 
     def after_tool_round(self) -> None:
         a = self.agent
-        a._openai_messages = a._normalize_openai_messages(a._openai_messages)
+        a._openai_messages = a._normalize_openai_messages(a._openai_messages, a._journal.resolve)
