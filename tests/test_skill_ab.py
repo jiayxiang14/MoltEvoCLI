@@ -156,3 +156,40 @@ def test_learning_experiment_end_to_end_with_fake_model(tmp_path, monkeypatch):
     learned = next(r for r in rows if r["condition"] == "learned")
     assert learned["skills_promoted"] == ["spdx-header"]
     assert summary["learned"]["passed"] == 1 and summary["control"]["passed"] == 0
+
+
+def test_errored_runs_are_excluded_from_statistics():
+    # 第 3 对里开 Skill 那次 API 失败：不能算成"开 Skill 失败"，这一对也不参与配对检验
+    recs = [{"task_id": "t", "rep": i, "condition": c, "passed": p, "error": e, "turns": 1, "cost_usd": None,
+             "tool_errors": 0}
+            for i, pair in enumerate([((True, ""), (False, "")), ((True, ""), (False, "")), ((False, "boom"), (True, ""))])
+            for c, (p, e) in zip(("on", "off"), pair)]
+    s = skill_ab.summarize(recs, "on", "off")
+    assert s["on"]["n"] == 2 and s["on"]["errored"] == 1 and s["on"]["rate"] == 1.0
+    assert s["off"]["n"] == 3 and s["off"]["passed"] == 1
+    assert s["paired"]["pairs"] == 2 and s["paired"]["only_off"] == 0
+    assert s["errored_runs"] == 1 and s["reliable"] is True
+    assert skill_ab.summarize(recs[:2] + [dict(r, error="x") for r in recs[2:]], "on", "off")["reliable"] is False
+
+
+def test_account_error_stops_the_experiment(tmp_path, monkeypatch):
+    import anthropic
+    import httpx
+    from agents.agent import Agent
+    suite = {"skills": SUITE["skills"], "tasks": [TASKS["pref-commit-msg"], TASKS["pref-tldr"]], "learning": []}
+    calls = []
+
+    async def broke(self, on_tool_block_complete=None, **k):
+        calls.append(1)
+        resp = httpx.Response(402, request=httpx.Request("POST", "https://fake.example"))
+        raise anthropic.APIStatusError("Insufficient Balance", response=resp, body=None)
+
+    monkeypatch.setattr(Agent, "_call_anthropic_stream", broke)
+    summary = asyncio.run(skill_ab.run_experiment(
+        "ab", reps=3, suite=suite, out_dir=tmp_path,
+        agent_kwargs={"model": "claude-sonnet-4-6", "api_key": "sk-test",
+                      "anthropic_base_url": "https://fake.example/anthropic"}))
+    assert summary["completed_runs"] == 1 and summary["planned_runs"] == 12
+    assert "Insufficient Balance" in summary["aborted"]
+    assert summary["skills_on"]["n"] == 0 and summary["reliable"] is False
+    assert len(calls) == 1                                    # 402 不重试

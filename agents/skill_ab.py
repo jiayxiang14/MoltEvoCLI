@@ -35,6 +35,10 @@ from typing import Any
 TASKS_FILE = Path(__file__).resolve().parents[1] / "data" / "skill_ab" / "tasks.json"
 RUNS_DIR = Path(__file__).resolve().parents[1] / "data" / "skill_ab" / "runs"
 TASK_TIMEOUT_S = 300
+# 账户类错误（密钥无效、余额不足、无权限）：重试和继续跑都没用，立即停止实验。
+FATAL_STATUS_CODES = {401, 402, 403}
+# 出错（没跑起来）的运行占比超过这个值时，汇总标注结果不可靠。
+MAX_ERROR_RATE = 0.2
 
 
 # ── 任务与判分 ────────────────────────────────────────────
@@ -119,25 +123,35 @@ def mcnemar_exact(b: int, c: int) -> float:
 
 
 def summarize(records: list[dict[str, Any]], a: str, b: str) -> dict[str, Any]:
-    """比较两个条件（a 为实验组，b 为对照组）。"""
+    """比较两个条件（a 为实验组，b 为对照组）。
+
+    出错的运行（API 调用失败、超时等，任务根本没跑完）不是"模型没做对"，不计入成功率、置信区间和配对检验，
+    只单独计数。"""
+    valid = [r for r in records if not r.get("error")]
+    errored = len(records) - len(valid)
     out: dict[str, Any] = {}
     for cond in (a, b):
-        rs = [r for r in records if r["condition"] == cond]
+        rs = [r for r in valid if r["condition"] == cond]
         s = sum(r["passed"] for r in rs)
         lo, hi = wilson(s, len(rs))
         out[cond] = {"n": len(rs), "passed": s, "rate": round(s / len(rs), 3) if rs else None,
                      "ci95": [round(lo, 3), round(hi, 3)],
+                     "errored": sum(1 for r in records if r["condition"] == cond and r.get("error")),
                      "avg_turns": _avg(rs, "turns"), "avg_cost_usd": _avg(rs, "cost_usd"),
                      "avg_tool_errors": _avg(rs, "tool_errors")}
+    out["errored_runs"] = errored
+    out["reliable"] = not records or errored / len(records) <= MAX_ERROR_RATE
     pairs = {}
-    for r in records:
+    for r in valid:
         pairs.setdefault((r["task_id"], r["rep"]), {})[r["condition"]] = r["passed"]
+    # 只有两个条件都有效运行的才算一对
+    pairs = {k: v for k, v in pairs.items() if a in v and b in v}
     only_a = sum(1 for v in pairs.values() if v.get(a) and v.get(b) is False)
     only_b = sum(1 for v in pairs.values() if v.get(b) and v.get(a) is False)
     out["paired"] = {"pairs": len(pairs), f"only_{a}": only_a, f"only_{b}": only_b,
                      "mcnemar_p": round(mcnemar_exact(only_a, only_b), 4)}
     per_task: dict[str, dict[str, int]] = {}
-    for r in records:
+    for r in valid:
         per_task.setdefault(r["task_id"], {}).setdefault(r["condition"], 0)
         per_task[r["task_id"]][r["condition"]] += int(r["passed"])
     out["per_task"] = per_task
@@ -150,6 +164,13 @@ def _avg(rs: list[dict[str, Any]], key: str) -> float | None:
 
 
 # ── 运行 ─────────────────────────────────────────────────
+
+def _describe_error(e: BaseException) -> tuple[str, bool]:
+    """返回 (错误说明, 是否为账户类致命错误)。"""
+    status = getattr(e, "status_code", None)
+    if isinstance(e, asyncio.TimeoutError):
+        return f"timeout after {TASK_TIMEOUT_S}s", False
+    return f"{type(e).__name__}: {e}", status in FATAL_STATUS_CODES
 
 @contextlib.contextmanager
 def sandbox(prefix: str):
@@ -193,16 +214,16 @@ async def run_task(task: dict[str, Any], suite: dict[str, Any], *, condition: st
     with sandbox(f"{task['id']}-{condition}") as root:
         materialize(task, root, skills=suite["skills"] if condition == "skills_on" else None)
         agent = make_agent(agent_kwargs, evolution=False)
-        started, answer, error = time.time(), "", ""
+        started, answer, error, fatal = time.time(), "", "", False
         try:
             result = await asyncio.wait_for(agent.run_once(task["prompt"]), timeout=TASK_TIMEOUT_S)
             answer = result["text"]
         except Exception as e:  # noqa: BLE001 - one bad run must not stop the experiment
-            error = f"{type(e).__name__}: {e}"
+            error, fatal = _describe_error(e)
         passed, detail = grade(task["check"], root, answer)
         st = agent.get_run_stats()
         return {"experiment": "ab", "task_id": task["id"], "category": task.get("category"), "condition": condition,
-                "rep": rep, "passed": passed and not error, "detail": detail, "error": error,
+                "rep": rep, "passed": passed and not error, "detail": detail, "error": error, "fatal": fatal,
                 "elapsed_s": round(time.time() - started, 2), "turns": st["turns"],
                 "tool_errors": st["tool_errors"], "cost_usd": st["cost_usd"], "model": st["model"]}
 
@@ -215,13 +236,19 @@ async def run_learning(item: dict[str, Any], suite: dict[str, Any], *, condition
     with sandbox(f"learn-{task['id']}-{condition}") as root:
         materialize(task, root, skills=None)
         promoted: list[str] = []
+        error, fatal = "", False
         if condition == "learned":
             from agents.skills import discover_skills, reset_skill_cache
             before = {s.name for s in discover_skills()}
             teacher = make_agent(agent_kwargs, evolution=True)
             for turn in item["teaching_turns"]:
-                with contextlib.suppress(Exception):
+                try:
                     await asyncio.wait_for(teacher.chat(turn), timeout=TASK_TIMEOUT_S)
+                except Exception as e:  # noqa: BLE001
+                    # 教学会话没跑完，这次"学习"就不成立，整次运行记为出错
+                    msg, fatal = _describe_error(e)
+                    error = f"teaching: {msg}"
+                    break
                 await teacher.drain_background_skill_tasks()
             for record in skill_candidates.pending():
                 # 还没过门禁的候选：模拟用户在 /skills review 里批准，保证结果可复现（静态检查仍然生效）
@@ -229,15 +256,17 @@ async def run_learning(item: dict[str, Any], suite: dict[str, Any], *, condition
             # 统计生效中 Skill 的增量：既包括上面批准的，也包括教学中已满足门禁、自动晋升的。
             reset_skill_cache()
             promoted = sorted({s.name for s in discover_skills()} - before)
-        agent = make_agent(agent_kwargs, evolution=False)
-        answer, error = "", ""
-        try:
-            answer = (await asyncio.wait_for(agent.run_once(task["prompt"]), timeout=TASK_TIMEOUT_S))["text"]
-        except Exception as e:  # noqa: BLE001
-            error = f"{type(e).__name__}: {e}"
+        answer = ""
+        if not error:
+            agent = make_agent(agent_kwargs, evolution=False)
+            try:
+                answer = (await asyncio.wait_for(agent.run_once(task["prompt"]), timeout=TASK_TIMEOUT_S))["text"]
+            except Exception as e:  # noqa: BLE001
+                error, fatal = _describe_error(e)
         passed, detail = grade(task["check"], root, answer)
         return {"experiment": "learning", "task_id": task["id"], "condition": condition, "rep": rep,
-                "passed": passed and not error, "detail": detail, "error": error, "skills_promoted": promoted}
+                "passed": passed and not error, "detail": detail, "error": error, "fatal": fatal,
+                "skills_promoted": promoted}
 
 
 async def run_experiment(kind: str, *, reps: int, agent_kwargs: dict[str, Any],
@@ -251,6 +280,7 @@ async def run_experiment(kind: str, *, reps: int, agent_kwargs: dict[str, Any],
         conditions, items, runner = ("skills_on", "skills_off"), suite["tasks"], run_task
     else:
         conditions, items, runner = ("learned", "control"), suite["learning"], run_learning
+    aborted = ""
     for item in items:
         for rep in range(1, reps + 1):
             for cond in conditions:
@@ -258,11 +288,30 @@ async def run_experiment(kind: str, *, reps: int, agent_kwargs: dict[str, Any],
                 records.append(rec)
                 with results_path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                print(f"[{len(records)}] {rec['task_id']} {cond} rep{rep}: {'PASS' if rec['passed'] else 'FAIL'}"
-                      f" ({rec['detail']}{'; ' + rec['error'] if rec['error'] else ''})")
+                status = "ERROR" if rec["error"] else ("PASS" if rec["passed"] else "FAIL")
+                print(f"[{len(records)}] {rec['task_id']} {cond} rep{rep}: {status}"
+                      f" ({rec['error'] or rec['detail']})")
+                if rec.get("fatal"):
+                    aborted = rec["error"]
+                    break
+            if aborted:
+                break
+        if aborted:
+            break
     summary = summarize(records, *conditions)
-    summary["note"] = (f"{len(items)} items x {reps} reps per condition; small samples only detect large effects. "
-                       "Graders are deterministic (no LLM judge).")
+    planned = len(items) * reps * len(conditions)
+    summary["planned_runs"] = planned
+    summary["completed_runs"] = len(records)
+    if aborted:
+        summary["aborted"] = f"stopped after an account error (retrying will not help): {aborted}"
+    notes = [f"{len(items)} items x {reps} reps per condition; small samples only detect large effects. "
+             "Graders are deterministic (no LLM judge). Errored runs are excluded from rates and pairing."]
+    if not summary["reliable"]:
+        notes.append(f"UNRELIABLE: {summary['errored_runs']} of {len(records)} runs errored "
+                     f"(more than {MAX_ERROR_RATE:.0%}); fix the cause and rerun.")
+    if aborted:
+        notes.append(f"INCOMPLETE: {len(records)} of {planned} planned runs.")
+    summary["note"] = " ".join(notes)
     (out_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
 
@@ -291,6 +340,8 @@ def main() -> None:
               "api_base": base if use_openai else None, "anthropic_base_url": None if use_openai else base}
     summary = asyncio.run(run_experiment(args.kind, reps=args.reps, agent_kwargs=kwargs))
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if summary.get("aborted") or not summary["reliable"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
