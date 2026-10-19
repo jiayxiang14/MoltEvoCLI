@@ -4,7 +4,8 @@ Skill 候选区与晋升门禁。
 自进化抽出的新 Skill、合并后的新版本，不再直接写进生效中的 Skill，而是先进候选区（不参与检索，
 不影响 agent 行为），过了门禁才晋升：
 1. 静态检查（确定性，不花钱）：说明非空、长度在上限内、不含密钥；
-2. 证据：同一个候选在不同轮次/会话出现 >= MIN_OCCURRENCES 次，或用户明确批准；
+2. 证据：同一个候选在 >= MIN_OCCURRENCES 个不同会话里出现，或用户明确批准；
+   同一会话里重复出现只更新内容、不计次数——一次任务里反复强调的要求更可能只属于这次任务；
 3. 用户手写的 Skill 对 agent 只读：想改它只能形成"覆盖候选"，必须由用户批准，永不自动晋升。
 
 晋升方式：acceptEdits / 跳过确认模式下过门禁即自动晋升；默认模式下进入"待批准"，用 /skills review 处理。
@@ -46,9 +47,16 @@ def _save(registry: dict[str, dict[str, Any]]) -> None:
     tmp.replace(path)          # 原子替换，进程中途退出不会留下写了一半的登记表
 
 
+def slug(text: str) -> str:
+    return re.sub(r'[^a-z0-9一-鿿]+', '-', str(text or "").lower()).strip('-')
+
+
 def _key(action: str, name: str, target: str) -> str:
-    ident = target if action == "merge" else name
-    return f"{action}:{re.sub(r'[^a-z0-9一-鿿]+', '-', ident.lower()).strip('-')}"
+    return f"{action}:{slug(target if action == 'merge' else name)}"
+
+
+def _session_count(sources: list[str]) -> int:
+    return len({s.rsplit(":", 1)[0] for s in sources})
 
 
 def skill_author(skill_dir: str | Path) -> str:
@@ -78,19 +86,23 @@ def static_problems(record: dict[str, Any]) -> list[str]:
 
 def stage(*, action: str, name: str, target_skill: str, description: str, when_to_use: str,
           instructions: str, tags: list[str] | None, evidence: str, reason: str,
-          session_id: str, window_id: str, target_is_manual: bool) -> dict[str, Any]:
-    """登记或更新一个候选；同一候选来自新的轮次/会话时计一次出现。返回最新记录。"""
+          session_id: str, window_id: str, target_is_manual: bool, key: str = "") -> dict[str, Any]:
+    """登记或更新一个候选；出现次数按不同会话计。key 非空时并入这个已有候选（见
+    online_skill_evolution 的待定候选匹配）。返回最新记录。"""
     registry = _load()
-    key = _key(action, name, target_skill)
+    if action == "add":
+        name = slug(name) or name          # 模型常给整句当名字，统一成 kebab-case
+    key = key if key in registry else _key(action, name, target_skill)
     now = time.time()
     record = registry.get(key) or {"key": key, "status": "pending", "created": now, "occurrences": 0,
                                    "sources": [], "approved": False}
     source = f"{session_id}:{window_id}"
     if source not in record["sources"]:
         record["sources"] = (record["sources"] + [source])[-20:]
-        record["occurrences"] = int(record.get("occurrences", 0)) + 1
+        record["occurrences"] = _session_count(record["sources"])
     record.update({
-        "action": action, "name": name, "target_skill": target_skill, "description": description,
+        # 名字沿用第一次登记的，避免每次换个说法就漂移；描述和正文用最新的（后一次通常更完整）。
+        "action": action, "name": record.get("name") or name, "target_skill": target_skill, "description": description,
         "when_to_use": when_to_use, "instructions": instructions, "tags": list(tags or []),
         "evidence": evidence, "reason": reason, "updated": now, "target_is_manual": target_is_manual,
     })

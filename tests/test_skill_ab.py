@@ -260,8 +260,11 @@ def test_learning_experiment_end_to_end_with_fake_model(tmp_path, monkeypatch):
     approved = next(r for r in rows if r["condition"] == "learned_approved")
     gate = next(r for r in rows if r["condition"] == "learned_gate")
     assert approved["skills_promoted"] == ["spdx-header"]
-    # 真实门禁：两段教学里同一个候选出现 2 次，自动晋升，不需要模拟批准
-    assert gate["skills_promoted"] == ["spdx-header"] and gate["pending_candidates"] == 0
+    # 真实门禁：同一个候选在两段教学（两个会话）里出现，自动晋升，不需要模拟批准。第二段的
+    # 后一个窗口对已晋升 Skill 的合并更新只在一个会话出现过，留在候选区。
+    assert gate["skills_promoted"] == ["spdx-header"] and gate["pending_candidates"] == 1
+    assert approved["memories_written"] == [] and summary["learning"]["learned_via"]["learned_gate"]["skill"] == \
+        {"n": 1, "passed": 1}
     assert summary["learned_approved"]["passed"] == 1 and summary["learned_gate"]["passed"] == 1
     assert summary["control"]["passed"] == 0
     assert summary["learning"]["promotion_rate"] == {"learned_approved": 1.0, "learned_gate": 1.0}

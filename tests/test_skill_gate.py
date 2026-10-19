@@ -66,12 +66,14 @@ def test_candidate_is_staged_not_activated(project):
     assert [r["name"] for r in sc.pending()] == ["commit-style"]
 
 
-def test_auto_promotes_after_second_occurrence_in_accept_edits(project):
+def test_auto_promotes_after_second_session_in_accept_edits(project):
     a = make_agent(permission_mode="acceptEdits")
-    evolve(a, {"action": "add"}, window="w1")
-    evolve(a, {"action": "add"}, window="w1")          # 同一窗口重复处理不计数
+    evolve(a, {"action": "add"}, window="w1", session="s1")
+    evolve(a, {"action": "add"}, window="w1", session="s1")    # 同一窗口重复处理不计数
+    evolve(a, {"action": "add"}, window="w2", session="s1")    # 同一会话的另一个窗口也不计数
     assert "commit-style" not in active_names()
-    evolve(a, {"action": "add"}, window="w2")
+    assert sc.pending()[0]["occurrences"] == 1
+    evolve(a, {"action": "add"}, window="w3", session="s2")
     assert "commit-style" in active_names()
     skill = next(s for s in skills_mod.discover_skills() if s.name == "commit-style")
     assert sc.skill_author(skill.skill_dir) == "agent"
@@ -89,14 +91,86 @@ def test_merge_into_user_written_skill_needs_approval(project):
     write_manual_skill(project)
     a = make_agent(permission_mode="bypassPermissions")
     decision = {"action": "merge", "target_skill": "team-rules", "merged_instructions": "Always run make lint and make test."}
-    evolve(a, decision, window="w1")
-    evolve(a, decision, window="w2")
+    evolve(a, decision, window="w1", session="s1")
+    evolve(a, decision, window="w2", session="s2")
     text = (project / ".moltevo" / "skills" / "team-rules" / "SKILL.md").read_text()
     assert "make test" not in text                         # 手写 Skill 没有被自动改写
     record = sc.pending()[0]
     assert record["target_is_manual"]
     assert sc.approve(record["key"])["ok"]
     assert "make test" in (project / ".moltevo" / "skills" / "team-rules" / "SKILL.md").read_text()
+
+
+LOGGER_1 = {"name": "Use project logger for error reporting instead of print",
+            "description": "Report errors through the project logger module, not print",
+            "when_to_use": "when handling errors in python code", "instructions": "Use log.error(...).",
+            "evidence": "user corrected print", "tags": []}
+LOGGER_2 = {"name": "use-project-logger-with-error-severity",
+            "description": "Errors go to the project logger at error severity",
+            "when_to_use": "error handling in python modules", "instructions": "Call log.error with the exception.",
+            "evidence": "user corrected print again", "tags": []}
+TESTS = {"name": "run-tests-before-done", "description": "Run the pytest suite before reporting a task as done",
+         "when_to_use": "after editing code", "instructions": "Run python -m pytest -q.",
+         "evidence": "user asked", "tags": []}
+
+
+def evolve_candidate(a, candidate, decision, *, session, window="w"):
+    async def sq(system, user):
+        if "Skill Extractor" in system:
+            return json.dumps({"skills": [candidate]})
+        return json.dumps(decision(json.loads(user)) if callable(decision) else decision)
+    a._build_side_query = lambda **kw: sq
+    a.session_id = session
+    run(a._run_online_skill_evolution({"messages": [{"role": "user", "content": "x"}],
+                                       "latest_user": window, "latest_assistant": "ok"}))
+
+
+def test_same_lesson_under_different_names_is_counted_once_and_promoted(project):
+    a = make_agent(permission_mode="bypassPermissions")
+    evolve_candidate(a, LOGGER_1, {"action": "add"}, session="s1")
+    evolve_candidate(a, LOGGER_2, {"action": "add"}, session="s2")
+    names = active_names()
+    assert "use-project-logger-for-error-reporting-instead-of-print" in names    # 名字沿用第一次的，并转成 kebab-case
+    assert "use-project-logger-with-error-severity" not in names
+    assert sc.pending() == []
+
+
+def test_model_can_link_a_pending_candidate_but_rules_must_agree(project):
+    a = make_agent(permission_mode="bypassPermissions")
+    evolve_candidate(a, LOGGER_1, {"action": "add"}, session="s1")
+    key = sc.pending()[0]["key"]
+    seen = {}
+
+    def says_same(payload):
+        seen["pending"] = payload["pending_candidates"]
+        return {"action": "add", "same_as_pending": key}
+    # 模型说相同，但内容几乎不重合：不合并
+    evolve_candidate(a, TESTS, says_same, session="s2")
+    assert seen["pending"][0]["key"] == key
+    assert {r["name"] for r in sc.pending()} == {"use-project-logger-for-error-reporting-instead-of-print",
+                                                 "run-tests-before-done"}
+    # 模型给了不存在的键：忽略，按规则判断
+    evolve_candidate(a, TESTS, {"action": "add", "same_as_pending": "add:nope"}, session="s3")
+    assert "run-tests-before-done" in active_names()                 # 自己的两个会话凑满了
+    assert "use-project-logger-for-error-reporting-instead-of-print" not in active_names()
+
+
+def test_moderate_overlap_merges_only_when_the_model_agrees(project):
+    a = make_agent(permission_mode="bypassPermissions")
+    first = dict(LOGGER_1, name="log-errors", description="Log errors with the project logger",
+                 when_to_use="error handling")
+    other = dict(LOGGER_1, name="error-reporting-format", description="Format error reports as JSON for the API",
+                 when_to_use="returning API errors from handlers")
+    evolve_candidate(a, first, {"action": "add"}, session="s1")
+    key = sc.pending()[0]["key"]
+    evolve_candidate(a, other, {"action": "add", "same_as_pending": key}, session="s2")   # 只重合 error 一个词
+    assert len(sc.pending()) == 2
+    similar = dict(first, name="report-failures-via-logger", description="Failures should be sent to the logger",
+                   when_to_use="exception handling")                     # 重合 logger、handling，介于两道阈值之间
+    evolve_candidate(a, similar, {"action": "add"}, session="s3")        # 模型没说相同：不合并
+    assert len(sc.pending()) == 3
+    evolve_candidate(a, similar, {"action": "add", "same_as_pending": key}, session="s4")
+    assert "log-errors" in active_names()
 
 
 def test_static_check_blocks_secrets_even_with_approval(project):
@@ -152,8 +226,8 @@ def _judge(name, skill_dir, used):
 
 def test_prune_agent_skill_but_only_flag_user_written(project):
     a = make_agent(permission_mode="acceptEdits")
-    evolve(a, {"action": "add"}, window="w1")
-    evolve(a, {"action": "add"}, window="w2")
+    evolve(a, {"action": "add"}, window="w1", session="s1")
+    evolve(a, {"action": "add"}, window="w2", session="s2")
     agent_dir = next(s for s in skills_mod.discover_skills() if s.name == "commit-style").skill_dir
     write_manual_skill(project)
     manual_dir = project / ".moltevo" / "skills" / "team-rules"

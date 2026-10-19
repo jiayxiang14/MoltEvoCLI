@@ -147,6 +147,41 @@ def _exact_identity_match(candidate: OnlineSkillCandidate, skills: list[Any]) ->
     return ""
 
 
+# 判断"是不是同一条经验"时忽略的英文虚词（检索用的分词不过滤这些词，会抬高不相干候选的重合度）。
+_IDENTITY_STOP = {
+    "a", "an", "the", "and", "or", "of", "to", "for", "in", "on", "with", "when", "use", "using",
+    "instead", "always", "before", "after", "any", "all", "is", "are", "be", "it", "this", "that",
+}
+SAME_PENDING_SURE = 0.6         # 只凭规则就判为同一条经验
+SAME_PENDING_WITH_MODEL = 0.3   # 管理模型说相同时，规则这边的最低要求
+
+
+def _identity_tokens(name: str, description: str, when_to_use: str) -> set[str]:
+    from .skills import _tokens
+    tokens = _tokens(" ".join([name, description, when_to_use])) - _IDENTITY_STOP
+    # 检索分词会把复数再展开出单数（errors → errors + error），这里只留单数，免得一个词算两次。
+    return {t for t in tokens if not (t.endswith("s") and t[:-1] in tokens)}
+
+
+def _match_pending(candidate: OnlineSkillCandidate, pending: list[dict[str, Any]], model_choice: str) -> str:
+    """在待定的新增候选里找同一条经验，返回它的键，找不到返回空串。
+
+    两段会话里模型给同一条经验起的名字往往不同，按名字做键永远凑不满出现次数。这里看
+    "名字 + 描述 + 适用场景"的词重合度（重合词数 / 较少一方的词数）：够高就直接认定；
+    管理模型说相同时要求放低，但规则不能反对——误合并会让一次性经验凑满次数被晋升。
+    """
+    mine = _identity_tokens(candidate.name, candidate.description, candidate.when_to_use)
+    best_key, best = "", 0.0
+    for record in pending:
+        theirs = _identity_tokens(record.get("name", ""), record.get("description", ""), record.get("when_to_use", ""))
+        score = len(mine & theirs) / min(len(mine), len(theirs)) if mine and theirs else 0.0
+        if model_choice and record["key"] == model_choice and score >= SAME_PENDING_WITH_MODEL:
+            return record["key"]
+        if score > best:
+            best_key, best = record["key"], score
+    return best_key if best >= SAME_PENDING_SURE else ""
+
+
 async def maintain_online_skill_candidate(
     *,
     candidate: OnlineSkillCandidate,
@@ -157,9 +192,12 @@ async def maintain_online_skill_candidate(
     session_id: str = "",
     window_id: str = "",
 ) -> dict[str, Any]:
+    from .skill_candidates import pending as pending_candidates
     from .skills import discover_skills, retrieve_relevant_skills
 
     skills = discover_skills()
+    # 待定候选还没生效，discover_skills 看不到；不把它们拿来比对，第二次出现只能另起一条。
+    pending = [r for r in pending_candidates() if r.get("action") == "add"][-20:]
     exact_target = _exact_identity_match(candidate, skills)
     similar_hits = retrieve_relevant_skills(_candidate_search_text(candidate), limit=8, min_score=0.03)
     top_reference_name = str((retrieved_reference or {}).get("name") or "").strip()
@@ -171,9 +209,12 @@ async def maintain_online_skill_candidate(
         "Schema:\n"
         "{\"action\":\"add|merge|discard\",\"target_skill\":\"existing name for merge\","
         "\"reason\":\"short reason\",\"merged_description\":\"optional\","
-        "\"merged_when_to_use\":\"optional\",\"merged_instructions\":\"optional full merged SKILL.md body\"}\n\n"
+        "\"merged_when_to_use\":\"optional\",\"merged_instructions\":\"optional full merged SKILL.md body\","
+        "\"same_as_pending\":\"optional key of a pending candidate\"}\n\n"
         "Rules:\n"
         "- Prefer merge over add when the same capability already exists.\n"
+        "- pending_candidates are lessons seen before but not yet active. If the candidate is the same lesson "
+        "(even under a different name), use action add and set same_as_pending to that candidate's key.\n"
         "- Discard if the candidate duplicates an existing shared/project skill and adds no user-specific durable improvement.\n"
         "- If merging, synthesize a complete merged instruction body, preserving useful existing guidance and adding only durable new guidance.\n"
         "- Do not preserve one-off payload, secrets, transient project facts, URLs, exact dates, or assistant-only claims.\n"
@@ -183,6 +224,9 @@ async def maintain_online_skill_candidate(
         "exact_identity_target": exact_target,
         "retrieved_reference": retrieved_reference or None,
         "similar_skills": similar_hits,
+        "pending_candidates": [
+            {k: r.get(k, "") for k in ("key", "name", "description", "when_to_use")} for r in pending
+        ],
         "existing_skills": [
             {
                 "name": getattr(skill, "name", ""),
@@ -222,12 +266,16 @@ async def maintain_online_skill_candidate(
         if not target_skill:
             return {"ok": False, "action": "merge", "error": "missing target_skill", "decision": decision}
 
+    same_key = _match_pending(candidate, pending, str(decision.get("same_as_pending") or "").strip()) \
+        if action == "add" else ""
+    same_name = next((r["name"] for r in pending if r["key"] == same_key), "")
+
     # 不再直接写进生效中的 Skill：先进候选区，过了门禁才晋升（见 skill_candidates.py）。
     from .skill_candidates import skill_author, stage
     target_def = next((s for s in skills if getattr(s, "name", "") == target_skill), None) if action == "merge" else None
     record = stage(
         action=action,
-        name=candidate.name,
+        name=same_name or candidate.name,
         target_skill=target_skill if action == "merge" else "",
         description=str(decision.get("merged_description") or candidate.description) if action == "merge" else candidate.description,
         when_to_use=str(decision.get("merged_when_to_use") or candidate.when_to_use),
@@ -238,8 +286,9 @@ async def maintain_online_skill_candidate(
         session_id=session_id,
         window_id=window_id,
         target_is_manual=bool(target_def and skill_author(getattr(target_def, "skill_dir", "")) != "agent"),
+        key=same_key,
     )
-    return {"ok": True, "action": "staged", "skill": target_skill or candidate.name, "candidate": asdict(candidate),
+    return {"ok": True, "action": "staged", "skill": target_skill or record["name"], "candidate": asdict(candidate),
             "decision": decision, "record": record}
 
 

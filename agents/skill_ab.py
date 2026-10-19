@@ -12,9 +12,10 @@ Skill 效果实验（问题清单第 44 条），v2。两个实验：
 2. 学习曲线（learning）：教学会话里由脚本扮演用户（明说的纠正、隐含的纠正、一次性指令三类），
    之后在新会话里做测试题。三个条件：
    - control：不经过教学；
-   - learned_approved：一段教学，没过门禁的候选由程序模拟批准（"抽取 → 检索 → 照做"链路的上限）；
-   - learned_gate：两段措辞不同的教学，用真实门禁，不模拟批准（真实使用时能否学会）。
-   一次性指令不应该被学成 Skill，晋升了就记为误学。
+   - learned_approved：一段教学，最新的待定候选由程序模拟批准（"抽取 → 检索 → 照做"链路的上限）；
+   - learned_gate：两段措辞不同的教学（两个会话），用真实门禁，不模拟批准（真实使用时能否学会）。
+   一次性指令不应该被学成 Skill 或写进记忆，出现了就记为误学。明说的偏好通常走记忆、隐含的做法
+   走 Skill，报告按"经由记忆 / 经由 Skill / 两者 / 都没有"拆分。
 
 判分全部确定性（文件内容、正则、Python 结构、执行过的命令、新建的文件），不用大模型判分。
 每次运行在独立临时目录、独立 HOME 里进行；完整轨迹（事件 JSONL + 最终消息）存在 runs/<时间>/trajectories/。
@@ -314,8 +315,19 @@ def summarize_learning(records: list[dict[str, Any]]) -> dict[str, Any]:
         "promotion_rate": {c: promoted_rate(should_learn, c) for c in ("learned_approved", "learned_gate")},
         # 不该学的（一次性指令）：晋升了就是误学
         "false_learning_rate": {c: promoted_rate(oneoff, c) for c in ("learned_approved", "learned_gate")},
+        # 一次性指令被写进记忆，同样是误学
+        "false_memory_rate": {c: _rate([bool(r.get("memories_written")) for r in oneoff
+                                        if r["condition"] == c and not r.get("error")])
+                              for c in ("learned_approved", "learned_gate")},
         "avg_pending_candidates_gate": _avg([r for r in records if r["condition"] == "learned_gate" and not r.get("error")],
                                             "pending_candidates"),
+        # 该学的题经由哪条通路学到：记忆 / Skill / 两者 / 都没有，以及各自的测试通过率
+        "learned_via": {
+            c: {via: {"n": len(rs), "passed": sum(1 for r in rs if r["passed"])}
+                for via in ("memory", "skill", "both", "neither")
+                for rs in [[r for r in should_learn if r["condition"] == c and not r.get("error")
+                            and _learned_via(r) == via]]}
+            for c in ("learned_approved", "learned_gate")},
     }
     out["per_item"] = summarize(records, "learned_approved", "control")["per_task"]
     return out
@@ -488,6 +500,16 @@ async def _teach(turns: list[str], agent_kwargs: dict[str, Any], events_path: Pa
     return error, fatal, cost
 
 
+def _memory_files() -> set[str]:
+    from agents.memory import get_memory_dir
+    return {p.name for p in get_memory_dir().glob("*.md") if p.name != "MEMORY.md"}
+
+
+def _learned_via(r: dict[str, Any]) -> str:
+    skill, memory = bool(r.get("skills_promoted")), bool(r.get("memories_written"))
+    return {(True, True): "both", (True, False): "skill", (False, True): "memory"}.get((skill, memory), "neither")
+
+
 async def run_learning(item: dict[str, Any], suite: dict[str, Any], *, condition: str, rep: int,
                        agent_kwargs: dict[str, Any], traj_dir: Path | None = None) -> dict[str, Any]:
     """learned_*：先跑教学会话（gate 条件跑两段）再在新会话里做测试题；control：直接做测试题。"""
@@ -496,6 +518,7 @@ async def run_learning(item: dict[str, Any], suite: dict[str, Any], *, condition
     item_id = item.get("id") or item["test_task"]
     with sandbox(f"learn-{item_id}-{condition}") as root:
         promoted: list[str] = []
+        memories: list[str] = []
         pending_left = 0
         error, fatal = "", False
         teach_cost: float | None = 0.0
@@ -503,6 +526,7 @@ async def run_learning(item: dict[str, Any], suite: dict[str, Any], *, condition
             from agents.skills import discover_skills, reset_skill_cache
             reset_skill_cache()
             before = {s.name for s in discover_skills()}
+            memories_before = _memory_files()
             sessions = [item["teaching_turns"]]
             if condition == "learned_gate":
                 sessions.append(item.get("teaching_turns_alt") or item["teaching_turns"])
@@ -516,13 +540,17 @@ async def run_learning(item: dict[str, Any], suite: dict[str, Any], *, condition
                 if error:
                     break
             if not error and condition == "learned_approved":
-                for record in skill_candidates.pending():
-                    # 模拟用户在 /skills review 里批准（静态检查仍然生效）
-                    skill_candidates.approve(record["key"])
+                # 模拟用户在 /skills review 里批准最新的那条（静态检查仍然生效）。全部批准会把
+                # 同一经验的几个中间版本都晋升出来，夸大重复。
+                latest = max(skill_candidates.pending(), key=lambda r: r.get("updated", 0), default=None)
+                if latest:
+                    skill_candidates.approve(latest["key"])
             pending_left = len(skill_candidates.pending())
             # 统计生效中 Skill 的增量：既包括批准的，也包括教学中满足门禁、自动晋升的。
             reset_skill_cache()
             promoted = sorted({s.name for s in discover_skills()} - before)
+            # 明说的偏好通常由 agent 自己写进记忆（抽取器会跳过记忆已覆盖的内容），两条通路都要记。
+            memories = sorted(_memory_files() - memories_before)
         # 测试题在干净的仓库里做，教学留下的文件不会让测试题"白送"
         reset_workspace(root)
         materialize(task, root, skills=None)
@@ -544,7 +572,7 @@ async def run_learning(item: dict[str, Any], suite: dict[str, Any], *, condition
         return {"experiment": "learning", "item_id": item_id, "kind": item.get("kind", "explicit"),
                 "task_id": task["id"], "condition": condition, "rep": rep,
                 "passed": passed and not error, "detail": detail, "error": error, "fatal": fatal,
-                "skills_promoted": promoted, "pending_candidates": pending_left,
+                "skills_promoted": promoted, "memories_written": memories, "pending_candidates": pending_left,
                 "teaching_cost_usd": round(teach_cost, 6) if teach_cost is not None else None,
                 "trajectory": events_path.name if events_path else None,
                 **usage}
@@ -661,10 +689,17 @@ def render_report(summary: dict[str, Any], records: list[dict[str, Any]]) -> str
                          f"only control {pp['only_control']}, McNemar p = {pp['mcnemar_p']}")
         lr = summary.get("learning", {})
         lines += ["", "## Learning quality", "",
-                  "| condition | promotion rate (should learn) | false learning rate (one-off) |", "|---|---|---|"]
+                  "| condition | promotion rate (should learn) | false learning: skill | false learning: memory |",
+                  "|---|---|---|---|"]
         for c in ("learned_approved", "learned_gate"):
             lines.append(f"| {c} | {_fmt(lr.get('promotion_rate', {}).get(c), True)} "
-                         f"| {_fmt(lr.get('false_learning_rate', {}).get(c), True)} |")
+                         f"| {_fmt(lr.get('false_learning_rate', {}).get(c), True)} "
+                         f"| {_fmt(lr.get('false_memory_rate', {}).get(c), True)} |")
+        lines += ["", "Learned via (should-learn items; passed / runs):", "",
+                  "| condition | memory | skill | both | neither |", "|---|---|---|---|---|"]
+        for c, via in lr.get("learned_via", {}).items():
+            lines.append(f"| {c} | " + " | ".join(f"{via[v]['passed']}/{via[v]['n']}"
+                                                  for v in ("memory", "skill", "both", "neither")) + " |")
         lines.append("")
         for kind, entry in summary.get("by_kind", {}).items():
             lines += [f"## {kind}", ""] + _stats_rows(entry, conds) + [""]
