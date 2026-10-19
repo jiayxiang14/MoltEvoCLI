@@ -7,7 +7,8 @@ Skill 效果实验（问题清单第 44 条），v2。两个实验：
    - skills_off：不装任何 Skill；
    - skills_isolated（--isolated 时才跑）：只装本题的 Skill，用来量出"干扰"本身的代价。
    另有一类"不该触发 Skill"的副作用题（negative）：任务本身做对了没有、有没有误用 Skill，分开记录。
-   每次运行记录漏斗：检索命中 → 模型调用 skill 工具 → 判分通过，失败时能看出卡在哪一步。
+   每次运行记录漏斗：检索命中（目标排第几：hit@1、MRR）→ 模型调用 skill 工具 → 判分通过，失败时能看出卡在哪一步。
+   调用了非目标 Skill 时区分两种：按那个 Skill 自身的规则本来就适用（任务的 also_applicable），还是真的误调用。
 2. 学习曲线（learning）：教学会话里由脚本扮演用户（明说的纠正、隐含的纠正、一次性指令三类），
    之后在新会话里做测试题。三个条件：
    - control：不经过教学；
@@ -276,14 +277,17 @@ def summarize_ab(records: list[dict[str, Any]], conditions: tuple[str, ...]) -> 
     for cond in [c for c in conditions if c != "skills_off"]:
         rs = [r for r in records if r["condition"] == cond and not r.get("error") and r.get("target_skills")]
         invoked = [r for r in rs if r.get("invoked_target")]
-        precisions = [r["retrieval_precision"] for r in rs if r.get("retrieval_precision") is not None]
+        ranks = [r.get("target_rank") for r in rs]
         funnel[cond] = {
             "runs": len(rs),
             "retrieval_recall_at_3": _rate([bool(r.get("retrieved_target")) for r in rs]),
-            "retrieval_precision": round(sum(precisions) / len(precisions), 3) if precisions else None,
+            "retrieval_hit_at_1": _rate([rank == 1 for rank in ranks]),
+            # 平均倒数排名：排第 1 记 1，第 2 记 1/2，没检索到记 0
+            "retrieval_mrr": round(sum(1 / k for k in ranks if k) / len(ranks), 3) if ranks else None,
             "invocation_rate": _rate([bool(r.get("invoked_target")) for r in rs]),
             "pass_rate_when_invoked": _rate([bool(r["passed"]) for r in invoked]),
             "pass_rate_when_not_invoked": _rate([bool(r["passed"]) for r in rs if not r.get("invoked_target")]),
+            "avg_applicable_extra_invocations": _avg(rs, "applicable_extra_invocations"),
             "avg_wrong_invocations": _avg(rs, "wrong_invocations"),
         }
     out["funnel"] = funnel
@@ -448,17 +452,19 @@ async def run_task(task: dict[str, Any], suite: dict[str, Any], *, condition: st
             _finish_trajectory(agent)
         retrieved = _retrieved(events_path)
         invoked = [str(a.get("skill_name", "")) for n, a in calls if n == "skill"]
-        hit = set(targets) & set(retrieved)
+        applicable = set(task.get("also_applicable") or [])
+        rank = next((i for i, name in enumerate(retrieved, start=1) if name in targets), None)
         return {"experiment": "ab", "task_id": task["id"], "category": task.get("category"), "condition": condition,
                 "rep": rep, "passed": correct and not misuse and not error, "correct": correct,
                 "misused": bool(misuse), "detail": "; ".join([detail] + [f"misuse: {d}" for d in misuse]),
                 "error": error, "fatal": fatal, "elapsed_s": round(time.time() - started, 2),
                 "target_skills": targets, "retrieved": retrieved,
-                "retrieved_target": bool(hit) if targets else None,
-                "retrieval_precision": round(len(hit) / len(retrieved), 3) if targets and retrieved else None,
+                "retrieved_target": rank is not None if targets else None,
+                "target_rank": rank if targets else None,
                 "invoked_skills": invoked,
                 "invoked_target": bool(set(targets) & set(invoked)) if targets else None,
-                "wrong_invocations": sum(1 for s in invoked if s not in targets),
+                "applicable_extra_invocations": sum(1 for s in invoked if s not in targets and s in applicable),
+                "wrong_invocations": sum(1 for s in invoked if s not in targets and s not in applicable),
                 "trajectory": events_path.name if events_path else None,
                 **usage}
 
@@ -640,12 +646,14 @@ def render_report(summary: dict[str, Any], records: list[dict[str, Any]]) -> str
                 lines.append("Misuse rate: " + ", ".join(f"{c} {_fmt(v, True)}" for c, v in entry["misuse_rate"].items()))
             lines.append("")
         lines += ["## Funnel (runs with a target skill installed)", "",
-                  "| condition | runs | retrieved (recall@3) | precision | invoked | pass if invoked | pass if not | wrong invocations |",
-                  "|---|---|---|---|---|---|---|---|"]
+                  "| condition | runs | recall@3 | hit@1 | MRR | invoked | pass if invoked | pass if not "
+                  "| extra (applicable) | wrong invocations |",
+                  "|---|---|---|---|---|---|---|---|---|---|"]
         for c, f in summary.get("funnel", {}).items():
-            lines.append(f"| {c} | {f['runs']} | {_fmt(f['retrieval_recall_at_3'], True)} | {_fmt(f['retrieval_precision'], True)} "
-                         f"| {_fmt(f['invocation_rate'], True)} | {_fmt(f['pass_rate_when_invoked'], True)} "
-                         f"| {_fmt(f['pass_rate_when_not_invoked'], True)} | {_fmt(f['avg_wrong_invocations'])} |")
+            lines.append(f"| {c} | {f['runs']} | {_fmt(f['retrieval_recall_at_3'], True)} | {_fmt(f['retrieval_hit_at_1'], True)} "
+                         f"| {_fmt(f['retrieval_mrr'])} | {_fmt(f['invocation_rate'], True)} "
+                         f"| {_fmt(f['pass_rate_when_invoked'], True)} | {_fmt(f['pass_rate_when_not_invoked'], True)} "
+                         f"| {_fmt(f['avg_applicable_extra_invocations'])} | {_fmt(f['avg_wrong_invocations'])} |")
         lines.append("")
     else:
         for c, pp in summary.get("vs_control", {}).items():

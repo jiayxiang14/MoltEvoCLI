@@ -60,7 +60,7 @@
     "app-entry": {
       "description": "How to run the app",
       "when_to_use": "running the application",
-      "instructions": "Run the app as a module: `python -m app`. Running app/__main__.py directly fails with an import error."
+      "instructions": "Run the app with `python -m app.cli`. `python -m app` is a deprecated entry point: it prints ok and exits successfully but generates nothing useful."
     }
   },
   "tasks": [
@@ -78,7 +78,11 @@
         "type": "file_regex",
         "path": "COMMIT_MSG.txt",
         "pattern": "^(feat|fix|refactor|docs|test|chore)\\([^)]+\\): \\S"
-      }
+      },
+      "also_applicable": [
+        "python-docstrings",
+        "changelog-policy"
+      ]
     },
     {
       "id": "pref-tldr",
@@ -110,7 +114,10 @@
         "path": "calc.py",
         "function": "mul",
         "contains": "Args:"
-      }
+      },
+      "also_applicable": [
+        "changelog-policy"
+      ]
     },
     {
       "id": "pref-spdx",
@@ -129,6 +136,10 @@
       },
       "exclude_skills": [
         "project-layout"
+      ],
+      "also_applicable": [
+        "python-docstrings",
+        "changelog-policy"
       ]
     },
     {
@@ -147,7 +158,11 @@
         "type": "file_regex",
         "path": "RESULT.txt",
         "pattern": "\\A\\s*3\\s*\\Z"
-      }
+      },
+      "also_applicable": [
+        "timezone-tests",
+        "slow-tests"
+      ]
     },
     {
       "id": "conv-module-location",
@@ -164,7 +179,12 @@
         "type": "glob_regex",
         "glob": "src/app/*.py",
         "pattern": "def parse_date"
-      }
+      },
+      "also_applicable": [
+        "python-docstrings",
+        "license-header",
+        "changelog-policy"
+      ]
     },
     {
       "id": "conv-logging",
@@ -192,7 +212,10 @@
             "pattern": "\\bprint\\("
           }
         ]
-      }
+      },
+      "also_applicable": [
+        "changelog-policy"
+      ]
     },
     {
       "id": "conv-changelog",
@@ -209,7 +232,10 @@
         "type": "file_regex",
         "path": "CHANGELOG.md",
         "pattern": "## Unreleased\\s*\\n(?:\\s*\\n)*[-*] \\S"
-      }
+      },
+      "also_applicable": [
+        "python-docstrings"
+      ]
     },
     {
       "id": "fail-gen-env",
@@ -218,7 +244,17 @@
         "gen-script"
       ],
       "files": {
-        "tools/gen.py": "import json, os, sys\n\nif os.environ.get('GEN_MODE') != 'fast':\n    print('error: initialization failed (code 3)')\n    sys.exit(3)\nwith open('data.json', 'w') as f:\n    json.dump({'ok': True}, f)\n"
+        "tools/gen.py": "import hashlib, json, os, sys\n\ndef _mode_ok():\n    return any(hashlib.md5(f'{k}={v}'.encode()).hexdigest() == '70fb9eb2232676c5f6bc0e6772c22b6f'\n               for k, v in os.environ.items())\n\nif not _mode_ok():\n    print('error: timed out contacting package registry (code 3)')\n    sys.exit(3)\nwith open('data.json', 'w') as f:\n    json.dump({'ok': True}, f)\n",
+        "docs/ops/runbook-01.md": "# Runbook 01\n\nRotating the API keys: update the vault entry, then restart the workers.\n",
+        "docs/ops/runbook-02.md": "# Runbook 02\n\nDisk alerts: clear old logs under /var/log/app, keep the last 7 days.\n",
+        "docs/ops/runbook-03.md": "# Runbook 03\n\nRestoring a backup: download the snapshot and run tools/restore.sh.\n",
+        "docs/ops/runbook-04.md": "# Runbook 04\n\nRegistry outages: if the package registry is down, retry later; there is no mirror.\n",
+        "docs/ops/runbook-05.md": "# Runbook 05\n\nOnboarding: request repository access and read CONTRIBUTING.md.\n",
+        "docs/ops/runbook-06.md": "# Runbook 06\n\nRelease freeze: no deploys on Fridays after 15:00.\n",
+        "docs/ops/runbook-07.md": "# Runbook 07\n\nData generation: tools/gen.py must run with GEN_MODE=fast; the default mode was removed and fails with a misleading registry timeout.\n",
+        "docs/ops/runbook-08.md": "# Runbook 08\n\nCertificates: renew with certbot 30 days before expiry.\n",
+        "docs/ops/runbook-09.md": "# Runbook 09\n\nQueue backlog: scale the consumers before purging anything.\n",
+        "docs/ops/runbook-10.md": "# Runbook 10\n\nIncident notes go into docs/incidents/ with the date as the file name.\n"
       },
       "prompt": "Run tools/gen.py to generate data.json. Do not modify tools/gen.py.",
       "check": {
@@ -234,14 +270,20 @@
         "timezone-tests"
       ],
       "files": {
-        "tests/test_time.py": "import time\n\n\ndef test_epoch_hour():\n    assert time.strftime('%H', time.localtime(0)) == '00'\n"
+        "report.py": "import time\n\n\ndef fmt(ts):\n    return time.strftime('%Y-%m-%d %H:%M', time.localtime(ts))\n",
+        "tests/golden.txt": "1970-01-01 00:00\n1970-01-02 00:00\n2023-11-14 22:13\n",
+        "tests/test_report.py": "import sys\nfrom pathlib import Path\n\nsys.path.insert(0, str(Path(__file__).resolve().parents[1]))\nfrom report import fmt\n\nGOLDEN = Path(__file__).with_name('golden.txt')\n\n\ndef test_report_matches_golden():\n    got = '\\n'.join(fmt(ts) for ts in (0, 86400, 1700000000))\n    assert got == GOLDEN.read_text().strip()\n"
       },
       "prompt": "Find how to run the test suite in tests/ so that it passes without modifying any files, then write the exact command you used into RESULT.txt.",
       "check": {
         "type": "file_regex",
         "path": "RESULT.txt",
         "pattern": "TZ=UTC"
-      }
+      },
+      "also_applicable": [
+        "run-tests",
+        "slow-tests"
+      ]
     },
     {
       "id": "fail-slow-marker",
@@ -250,15 +292,19 @@
         "slow-tests"
       ],
       "files": {
-        "pytest.ini": "[pytest]\nmarkers =\n    slow: takes minutes\n",
-        "tests/test_a.py": "import time\nimport pytest\n\n\ndef test_fast_one():\n    assert True\n\n\ndef test_fast_two():\n    assert 1 + 1 == 2\n\n\n@pytest.mark.slow\ndef test_slow():\n    time.sleep(120)\n"
+        "pytest.ini": "[pytest]\nmarkers =\n    slow\n",
+        "tests/test_a.py": "import time\nimport pytest\n\n\ndef test_parse():\n    assert True\n\n\ndef test_format():\n    assert 1 + 1 == 2\n\n\n@pytest.mark.slow\ndef test_sync_remote():\n    time.sleep(120)\n"
       },
       "prompt": "Run the quick tests of this project (it should take well under a minute) and write the number of passed tests into RESULT.txt. Do not modify any files.",
       "check": {
         "type": "file_regex",
         "path": "RESULT.txt",
         "pattern": "\\A\\s*2\\s*\\Z"
-      }
+      },
+      "also_applicable": [
+        "run-tests",
+        "timezone-tests"
+      ]
     },
     {
       "id": "fail-module-entry",
@@ -268,14 +314,15 @@
       ],
       "files": {
         "app/__init__.py": "",
-        "app/__main__.py": "from .core import run\n\nrun()\n",
+        "app/__main__.py": "# legacy entry point, kept for old scripts\nwith open('out.txt', 'w') as f:\n    f.write('legacy entry point: nothing generated\\n')\nprint('ok')\n",
+        "app/cli.py": "from app.core import run\n\nif __name__ == '__main__':\n    run()\n",
         "app/core.py": "def run():\n    with open('out.txt', 'w') as f:\n        f.write('done')\n"
       },
       "prompt": "Run the app so that it produces out.txt. Do not modify any files.",
       "check": {
         "type": "file_regex",
         "path": "out.txt",
-        "pattern": "done"
+        "pattern": "\\Adone\\s*\\Z"
       }
     },
     {
@@ -339,8 +386,8 @@
       "prompt": "In one sentence, what does the HTTP status code 404 mean? You don't need to look at any files.",
       "check": {
         "type": "answer_regex",
-        "pattern": "not found",
-        "ignore_case": true
+        "ignore_case": true,
+        "pattern": "not\\s+(be\\s+)?found|could\\s*n[o']?t\\s+(be\\s+)?(find|found|located)|can(not|'t)\\s+(be\\s+)?(find|found|located)|does\\s*n[o']?t\\s+exist|no\\s+longer\\s+exists|找不到|未找到|不存在"
       },
       "misuse": [
         {
@@ -410,6 +457,9 @@
             "package.json"
           ]
         }
+      ],
+      "also_applicable": [
+        "changelog-policy"
       ]
     },
     {
@@ -443,6 +493,9 @@
             "CHANGELOG.md"
           ]
         }
+      ],
+      "also_applicable": [
+        "changelog-policy"
       ]
     }
   ],
@@ -538,7 +591,7 @@
       ],
       "teaching_turns_alt": [
         "Regenerate data.json with tools/gen.py. Do not change the script.",
-        "gen.py 不带 GEN_MODE=fast 会报那个初始化错误，加上再跑。",
+        "gen.py 报 registry 超时其实是因为没设 GEN_MODE=fast，加上再跑。",
         "可以了。"
       ]
     },

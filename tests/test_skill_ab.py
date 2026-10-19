@@ -46,7 +46,7 @@ NAIVE = {
     "fail-gen-env": ({}, ""),
     "fail-tz": ({"RESULT.txt": "python -m pytest -q\n"}, ""),
     "fail-slow-marker": ({"RESULT.txt": "3\n"}, ""),
-    "fail-module-entry": ({}, ""),
+    "fail-module-entry": ({"out.txt": "legacy entry point: nothing generated\n"}, ""),
     "neg-readme-typo": ({}, ""),
     "neg-json-config": ({}, ""),
     "neg-http-question": ({}, "It is a client error."),
@@ -103,6 +103,8 @@ def test_suite_is_consistent():
     for t in SUITE["tasks"]:
         assert set(t.get("skills") or []) <= set(SUITE["skills"]) and set(t.get("exclude_skills") or []) <= names
         assert not set(t.get("skills") or []) & set(t.get("exclude_skills") or [])
+        also = set(t.get("also_applicable") or [])
+        assert also <= set(SUITE["skills"]) and not also & set(t.get("skills") or []) and not also & set(t.get("exclude_skills") or [])
     kinds = [i["kind"] for i in SUITE["learning"]]
     assert kinds.count("explicit") == 4 and kinds.count("implicit") == 3 and kinds.count("oneoff") == 2
     for i in SUITE["learning"]:
@@ -127,13 +129,40 @@ def test_reset_workspace_keeps_learned_state(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == [".moltevo", "_home"]
 
 
+@pytest.mark.parametrize("answer", [
+    "HTTP 404 means the server could not find the requested resource.",
+    "It means the page was not found.",
+    "404 indicates the requested resource doesn't exist on the server.",
+    "404 表示服务器找不到请求的资源。",
+])
+def test_http_question_accepts_paraphrases(tmp_path, answer):
+    assert skill_ab.grade(TASKS["neg-http-question"]["check"], tmp_path, answer)[0]
+
+
 def test_failure_lesson_fixtures_really_fail_without_the_trick(tmp_path):
     # 确认"失败经验"类任务的坑是真的：不照 Skill 做就会失败，照做就成功
     task = TASKS["fail-gen-env"]
     skill_ab.materialize(task, tmp_path, skills=None)
+    assert "GEN_MODE" not in (tmp_path / "tools" / "gen.py").read_text()      # 源码里看不出来，要去文档里找
     env = {k: v for k, v in os.environ.items() if k != "GEN_MODE"}
-    assert subprocess.run([sys.executable, "tools/gen.py"], cwd=tmp_path, env=env).returncode == 3
+    plain = subprocess.run([sys.executable, "tools/gen.py"], cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert plain.returncode == 3 and "registry" in plain.stdout                # 报错信息有误导性
     assert subprocess.run([sys.executable, "tools/gen.py"], cwd=tmp_path, env={**env, "GEN_MODE": "fast"}).returncode == 0
+    assert sum("GEN_MODE" in (tmp_path / f).read_text() for f in task["files"] if f.startswith("docs/")) == 1
+
+    task = TASKS["fail-tz"]
+    skill_ab.materialize(task, tmp_path / "tz", skills=None)
+    run = lambda tz: subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],  # noqa: E731
+                                    cwd=tmp_path / "tz", capture_output=True, text=True, env={**os.environ, "TZ": tz})
+    assert run("Asia/Shanghai").returncode != 0 and run("UTC").returncode == 0
+
+    task = TASKS["fail-module-entry"]
+    skill_ab.materialize(task, tmp_path / "m", skills=None)
+    legacy = subprocess.run([sys.executable, "-m", "app"], cwd=tmp_path / "m", capture_output=True, text=True)
+    assert legacy.returncode == 0 and "ok" in legacy.stdout                    # 看起来成功了
+    assert not skill_ab.grade(task["check"], tmp_path / "m", "")[0]            # 实际没产出
+    subprocess.run([sys.executable, "-m", "app.cli"], cwd=tmp_path / "m", check=True)
+    assert skill_ab.grade(task["check"], tmp_path / "m", "")[0]
     task = TASKS["conv-test-count"]
     skill_ab.materialize(task, tmp_path / "t", skills=None)
     plain = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"], cwd=tmp_path / "t",
@@ -182,6 +211,7 @@ def test_ab_experiment_end_to_end_with_fake_model(tmp_path, monkeypatch):
     # 漏斗：开 Skill 组在 19 个 Skill 里检索到了目标；假模型没调用 skill 工具
     funnel = summary["funnel"]["skills_on"]
     assert funnel["runs"] == 2 and funnel["retrieval_recall_at_3"] == 1.0 and funnel["invocation_rate"] == 0.0
+    assert funnel["retrieval_hit_at_1"] == 1.0 and funnel["retrieval_mrr"] == 1.0
     traj = tmp_path / "trajectories" / "pref-commit-msg-skills_on-1.jsonl"
     types = [__import__("json").loads(l)["type"] for l in traj.read_text().splitlines()]
     assert "skill_retrieved" in types and "model_call" in types and types[-1] == "final_messages"
@@ -282,3 +312,25 @@ def test_account_error_stops_the_experiment(tmp_path, monkeypatch):
     assert "Insufficient Balance" in summary["aborted"]
     assert summary["skills_on"]["n"] == 0 and summary["reliable"] is False
     assert len(calls) == 1                                    # 402 不重试
+
+
+def test_invocations_are_split_into_applicable_and_wrong(tmp_path, monkeypatch):
+    # 新建 Python 文件时调用 python-docstrings 是合理的（also_applicable），调用 docker-build 才是误调用
+    from agents.agent import Agent
+    task = TASKS["pref-spdx"]
+    plan = [("skill", {"skill_name": "license-header"}), ("skill", {"skill_name": "python-docstrings"}),
+            ("skill", {"skill_name": "docker-build"}),
+            ("write_file", {"file_path": "strutil.py", "content": "# SPDX-License-Identifier: MIT\ndef slugify(t):\n    return t\n"})]
+
+    async def fake_stream(self, on_tool_block_complete=None, **k):
+        done = sum(1 for m in self._anthropic_messages if m["role"] == "assistant")
+        if done < len(plan):
+            return anth(tools=[plan[done]])
+        return anth(text="done")
+
+    monkeypatch.setattr(Agent, "_call_anthropic_stream", fake_stream)
+    rec = asyncio.run(skill_ab.run_task(task, SUITE, condition="skills_on", rep=1, traj_dir=tmp_path,
+                                        agent_kwargs={"model": "claude-sonnet-4-6", "api_key": "sk-test",
+                                                      "anthropic_base_url": "https://fake.example/anthropic"}))
+    assert rec["passed"] and rec["invoked_target"]
+    assert rec["applicable_extra_invocations"] == 1 and rec["wrong_invocations"] == 1
