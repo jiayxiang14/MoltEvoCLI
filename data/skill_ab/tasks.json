@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "description": "MoltEvo skill A/B and learning-curve suite (deterministic graders).",
+  "version": 2,
+  "description": "MoltEvo skill A/B and learning-curve suite v2 (deterministic graders): target skill among all other skills plus distractors, negative-transfer tasks, explicit/implicit/one-off learning.",
   "skills": {
     "commit-style": {
       "description": "Commit message convention for this repository",
@@ -126,7 +126,10 @@
         "type": "file_regex",
         "path": "strutil.py",
         "pattern": "\\A# SPDX-License-Identifier: MIT"
-      }
+      },
+      "exclude_skills": [
+        "project-layout"
+      ]
     },
     {
       "id": "conv-test-count",
@@ -274,6 +277,173 @@
         "path": "out.txt",
         "pattern": "done"
       }
+    },
+    {
+      "id": "neg-readme-typo",
+      "category": "negative",
+      "skills": [],
+      "files": {
+        "README.md": "# Calc\n\nA tiny calcualtor library.\n",
+        "calc.py": "def add(a, b):\n    return a + b\n"
+      },
+      "prompt": "Fix the spelling mistake in README.md.",
+      "check": {
+        "type": "all",
+        "checks": [
+          {
+            "type": "file_regex",
+            "path": "README.md",
+            "pattern": "calculator"
+          },
+          {
+            "type": "file_not_regex",
+            "path": "README.md",
+            "pattern": "calcualtor"
+          }
+        ]
+      },
+      "misuse": [
+        {
+          "type": "no_new_files",
+          "allow": []
+        }
+      ]
+    },
+    {
+      "id": "neg-json-config",
+      "category": "negative",
+      "skills": [],
+      "files": {
+        "config.json": "{\n  \"timeout\": 30,\n  \"retries\": 3\n}\n"
+      },
+      "prompt": "Change the timeout in config.json to 60.",
+      "check": {
+        "type": "file_regex",
+        "path": "config.json",
+        "pattern": "\"timeout\":\\s*60\\b"
+      },
+      "misuse": [
+        {
+          "type": "no_new_files",
+          "allow": []
+        }
+      ]
+    },
+    {
+      "id": "neg-http-question",
+      "category": "negative",
+      "skills": [],
+      "files": {
+        "README.md": "# api\n"
+      },
+      "prompt": "In one sentence, what does the HTTP status code 404 mean? You don't need to look at any files.",
+      "check": {
+        "type": "answer_regex",
+        "pattern": "not found",
+        "ignore_case": true
+      },
+      "misuse": [
+        {
+          "type": "not",
+          "check": {
+            "type": "answer_regex",
+            "pattern": "TL;DR"
+          }
+        },
+        {
+          "type": "no_new_files",
+          "allow": []
+        }
+      ]
+    },
+    {
+      "id": "neg-count-lines",
+      "category": "negative",
+      "skills": [],
+      "files": {
+        "data.csv": "id,name\n1,a\n2,b\n3,c\n4,d\n",
+        "tests/test_x.py": "def test_x():\n    assert True\n"
+      },
+      "prompt": "Count the number of lines in data.csv and write just the number into RESULT.txt.",
+      "check": {
+        "type": "file_regex",
+        "path": "RESULT.txt",
+        "pattern": "\\A\\s*5\\s*\\Z"
+      },
+      "misuse": [
+        {
+          "type": "no_command_regex",
+          "pattern": "pytest"
+        },
+        {
+          "type": "no_new_files",
+          "allow": [
+            "RESULT.txt"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "neg-js-file",
+      "category": "negative",
+      "skills": [],
+      "files": {
+        "README.md": "# web utils\n"
+      },
+      "prompt": "Create util.js in the repository root that exports a function capitalize(s) which uppercases the first letter of s.",
+      "check": {
+        "type": "file_regex",
+        "path": "util.js",
+        "pattern": "capitalize"
+      },
+      "misuse": [
+        {
+          "type": "file_not_regex",
+          "path": "util.js",
+          "pattern": "\\A\\s*#"
+        },
+        {
+          "type": "no_new_files",
+          "allow": [
+            "util.js",
+            "CHANGELOG.md",
+            "package.json"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "neg-rename-var",
+      "category": "negative",
+      "skills": [],
+      "files": {
+        "src/app/__init__.py": "",
+        "src/app/geometry.py": "def area(w, h):\n    tmp = w * h\n    return tmp\n"
+      },
+      "prompt": "In src/app/geometry.py, rename the local variable `tmp` in area() to `result`.",
+      "check": {
+        "type": "all",
+        "checks": [
+          {
+            "type": "file_regex",
+            "path": "src/app/geometry.py",
+            "pattern": "result = w \\* h"
+          },
+          {
+            "type": "file_not_regex",
+            "path": "src/app/geometry.py",
+            "pattern": "\\btmp\\b"
+          }
+        ]
+      },
+      "misuse": [
+        {
+          "type": "no_new_files",
+          "allow": [
+            "CHANGELOG.md"
+          ]
+        }
+      ]
     }
   ],
   "learning": [
@@ -283,6 +453,13 @@
         "Add a function `div(a, b)` to calc.py and write the commit message for it into COMMIT_MSG.txt (do not run git).",
         "以后写提交信息请一律用 Conventional Commits 格式并带 scope，例如 feat(calc): add div。请按这个格式重写 COMMIT_MSG.txt。",
         "好的，谢谢。"
+      ],
+      "id": "explicit-commit-msg",
+      "kind": "explicit",
+      "teaching_turns_alt": [
+        "Add a function `mod(a, b)` to calc.py and put the commit message for it in COMMIT_MSG.txt (do not run git).",
+        "提交信息的格式不对。我们项目统一用 Conventional Commits，要带 scope，比如 feat(calc): add mod，以后都这样写。请改一下 COMMIT_MSG.txt。",
+        "可以了。"
       ]
     },
     {
@@ -291,6 +468,13 @@
         "Explain what calc.py does.",
         "以后解释代码时，回答的最后一行都要以 TL;DR: 开头，给一句话总结。请按这个要求重新回答。",
         "好的，谢谢。"
+      ],
+      "id": "explicit-tldr",
+      "kind": "explicit",
+      "teaching_turns_alt": [
+        "What does the function add in calc.py do?",
+        "解释代码的时候，最后一行请固定用 TL;DR: 开头写一句话总结，以后都这样。请重新回答。",
+        "可以了。"
       ]
     },
     {
@@ -299,6 +483,13 @@
         "Add a function `square(x)` to calc.py.",
         "以后新写的 Python 函数都要有 Google 风格的 docstring，包含 Args: 和 Returns: 两节。请补上。",
         "好的，谢谢。"
+      ],
+      "id": "explicit-docstring",
+      "kind": "explicit",
+      "teaching_turns_alt": [
+        "Add a function `cube(x)` to calc.py.",
+        "新函数要写 Google 风格 docstring，有 Args: 和 Returns:，以后都按这个来。请补上。",
+        "可以了。"
       ]
     },
     {
@@ -307,7 +498,141 @@
         "Create a module textutil.py with a function `shout(text)` that returns text.upper().",
         "以后新建的 Python 文件第一行都要是 # SPDX-License-Identifier: MIT。请补上。",
         "好的，谢谢。"
+      ],
+      "id": "explicit-spdx",
+      "kind": "explicit",
+      "teaching_turns_alt": [
+        "Create a module numutil.py with a function `clamp(x, lo, hi)`.",
+        "新建的 Python 文件，第一行必须是 # SPDX-License-Identifier: MIT，以后都要这样。请补上。",
+        "可以了。"
+      ]
+    },
+    {
+      "id": "implicit-logging",
+      "kind": "implicit",
+      "test_task": "conv-logging",
+      "teaching_files": {
+        "src/app/__init__.py": "",
+        "src/app/log.py": "import logging\n\nlog = logging.getLogger('app')\n",
+        "src/app/auth.py": "def read_token(path):\n    with open(path) as f:\n        return f.read().strip()\n"
+      },
+      "teaching_turns": [
+        "Make read_token in src/app/auth.py return an empty string and report the problem when the file is missing.",
+        "别用 print，项目里有 app.log 的 log，报错用 log.error。改一下。",
+        "好的，谢谢。"
+      ],
+      "teaching_turns_alt": [
+        "read_token in src/app/auth.py should also handle a permission error: report it and return an empty string.",
+        "又用 print 了。项目里报问题用 from app.log import log 然后 log.warning 或 log.error。改一下。",
+        "可以了。"
+      ]
+    },
+    {
+      "id": "implicit-gen",
+      "kind": "implicit",
+      "test_task": "fail-gen-env",
+      "teaching_turns": [
+        "Run tools/gen.py to generate data.json. Do not modify tools/gen.py.",
+        "这个脚本要设置环境变量 GEN_MODE=fast 才能跑，试一下。",
+        "好了，谢谢。"
+      ],
+      "teaching_turns_alt": [
+        "Regenerate data.json with tools/gen.py. Do not change the script.",
+        "gen.py 不带 GEN_MODE=fast 会报那个初始化错误，加上再跑。",
+        "可以了。"
+      ]
+    },
+    {
+      "id": "implicit-run-tests",
+      "kind": "implicit",
+      "test_task": "conv-test-count",
+      "teaching_turns": [
+        "Run this project's tests and tell me whether they pass. Do not modify any files.",
+        "这个项目是 src 布局，要用 PYTHONPATH=src python -m pytest -q 跑。再试一次。",
+        "好的，谢谢。"
+      ],
+      "teaching_turns_alt": [
+        "Check whether the test suite passes. Do not change any files.",
+        "直接跑 pytest 会 ImportError，要加 PYTHONPATH=src。重跑一下。",
+        "可以了。"
+      ]
+    },
+    {
+      "id": "oneoff-print",
+      "kind": "oneoff",
+      "test_task": "conv-logging",
+      "teaching_files": {
+        "src/app/__init__.py": "",
+        "src/app/log.py": "import logging\n\nlog = logging.getLogger('app')\n",
+        "src/app/auth.py": "def read_token(path):\n    with open(path) as f:\n        return f.read().strip()\n"
+      },
+      "teaching_turns": [
+        "Make read_token in src/app/auth.py return an empty string when the file is missing.",
+        "这次先直接用 print 打个提示就行，我在临时调试。",
+        "好的，谢谢。"
+      ],
+      "teaching_turns_alt": [
+        "read_token in src/app/auth.py should also return an empty string on a permission error.",
+        "这次也先用 print 吧，只是临时看一下。",
+        "可以了。"
+      ]
+    },
+    {
+      "id": "oneoff-wip",
+      "kind": "oneoff",
+      "test_task": "pref-commit-msg",
+      "teaching_turns": [
+        "Add a function `div(a, b)` to calc.py and write the commit message for it into COMMIT_MSG.txt (do not run git).",
+        "这次提交信息随便写个 wip 就行，我待会儿会 squash。",
+        "好的，谢谢。"
+      ],
+      "teaching_turns_alt": [
+        "Add a function `mod(a, b)` to calc.py and put the commit message in COMMIT_MSG.txt (do not run git).",
+        "这次也写 wip 就行，反正要 squash。",
+        "可以了。"
       ]
     }
-  ]
+  ],
+  "distractors": {
+    "react-components": {
+      "description": "Conventions for React components",
+      "when_to_use": "creating or editing React .jsx/.tsx components",
+      "instructions": "Use function components with hooks, one component per file, PascalCase file names."
+    },
+    "sql-migrations": {
+      "description": "Database schema change process",
+      "when_to_use": "changing the database schema or adding tables",
+      "instructions": "Create a new numbered migration under migrations/. Never edit a migration that has already been applied."
+    },
+    "docker-build": {
+      "description": "Building container images",
+      "when_to_use": "building or changing the Docker image",
+      "instructions": "Use multi-stage builds, pin base images by digest, and run the final image as a non-root user."
+    },
+    "api-error-format": {
+      "description": "Error format for HTTP API endpoints",
+      "when_to_use": "returning errors from HTTP endpoints",
+      "instructions": "Return JSON {\"error\": {\"code\": ..., \"message\": ...}} with the matching HTTP status code."
+    },
+    "release-process": {
+      "description": "How to cut a release",
+      "when_to_use": "preparing a release or bumping the version",
+      "instructions": "Bump the version in pyproject.toml, move the Unreleased entries in CHANGELOG.md under the new version, then tag vX.Y.Z."
+    },
+    "python-test-style": {
+      "description": "How to write new Python tests",
+      "when_to_use": "writing or adding new Python tests",
+      "instructions": "Use plain pytest functions (no unittest classes), name files test_<module>.py, one behavior per test."
+    },
+    "data-files": {
+      "description": "Generated data files under data/",
+      "when_to_use": "editing CSV or JSON files under the data/ directory",
+      "instructions": "Files under data/ are generated. Never edit them by hand; regenerate them with `make data`."
+    },
+    "code-review": {
+      "description": "How to review code changes",
+      "when_to_use": "asked to review a diff or pull request",
+      "instructions": "Check correctness, tests and naming. Reply with a bulleted list of comments grouped by file."
+    }
+  }
 }

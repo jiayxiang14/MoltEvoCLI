@@ -539,6 +539,11 @@ class Agent:
         turns_before = self.current_turns
         turn_error: str | None = None
         self._recorder.emit("turn_start", input_chars=len(original_user_message), **self._trace_fields())
+        if not self.is_sub_agent:
+            # 记录检索结果：排查"Skill 没被用上"时，先看是没检索到还是检索到了模型没用。
+            self._recorder.emit("skill_retrieved", skills=[
+                {"name": h.get("name"), "score": round(float(h.get("score", 0.0)), 3)}
+                for h in self._last_retrieved_skill_hits], **self._trace_fields())
         coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
         self._current_task = asyncio.create_task(coro)
         try:

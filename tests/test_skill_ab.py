@@ -27,6 +27,12 @@ GOOD = {
     "fail-tz": ({"RESULT.txt": "TZ=UTC python -m pytest -q\n"}, ""),
     "fail-slow-marker": ({"RESULT.txt": "2\n"}, ""),
     "fail-module-entry": ({"out.txt": "done"}, ""),
+    "neg-readme-typo": ({"README.md": "# Calc\n\nA tiny calculator library.\n"}, ""),
+    "neg-json-config": ({"config.json": '{\n  "timeout": 60,\n  "retries": 3\n}\n'}, ""),
+    "neg-http-question": ({}, "It means the requested resource was not found on the server."),
+    "neg-count-lines": ({"RESULT.txt": "5\n"}, ""),
+    "neg-js-file": ({"util.js": "export function capitalize(s) {\n  return s[0].toUpperCase() + s.slice(1);\n}\n"}, ""),
+    "neg-rename-var": ({"src/app/geometry.py": "def area(w, h):\n    result = w * h\n    return result\n"}, ""),
 }
 NAIVE = {
     "pref-commit-msg": ({"COMMIT_MSG.txt": "Add sub function\n"}, ""),
@@ -41,6 +47,22 @@ NAIVE = {
     "fail-tz": ({"RESULT.txt": "python -m pytest -q\n"}, ""),
     "fail-slow-marker": ({"RESULT.txt": "3\n"}, ""),
     "fail-module-entry": ({}, ""),
+    "neg-readme-typo": ({}, ""),
+    "neg-json-config": ({}, ""),
+    "neg-http-question": ({}, "It is a client error."),
+    "neg-count-lines": ({"RESULT.txt": "4\n"}, ""),
+    "neg-js-file": ({}, ""),
+    "neg-rename-var": ({}, ""),
+}
+# 副作用题：任务做对了，但误用了 Skill（文件, 回答, 执行过的命令）—— 必须被判为误用
+MISUSE = {
+    "neg-readme-typo": ({"README.md": "# Calc\n\nA tiny calculator library.\n", "CHANGELOG.md": "## Unreleased\n- typo\n"}, "", []),
+    "neg-json-config": ({"config.json": '{"timeout": 60, "retries": 3}', "migrations/001.sql": "--"}, "", []),
+    "neg-http-question": ({}, "The resource was not found.\nTL;DR: not found.", []),
+    "neg-count-lines": ({"RESULT.txt": "5\n"}, "", ["python -m pytest -q"]),
+    "neg-js-file": ({"util.js": "# SPDX-License-Identifier: MIT\nexport function capitalize(s) { return s; }\n"}, "", []),
+    "neg-rename-var": ({"src/app/geometry.py": "def area(w, h):\n    result = w * h\n    return result\n",
+                        "src/app/area_utils.py": "# new\n"}, "", []),
 }
 
 
@@ -58,8 +80,51 @@ def test_grader_accepts_good_and_rejects_naive(tmp_path, task_id):
     good, naive = tmp_path / "good", tmp_path / "naive"
     _apply(task, good, GOOD[task_id][0])
     _apply(task, naive, NAIVE[task_id][0])
-    assert skill_ab.grade(task["check"], good, GOOD[task_id][1])[0], task_id
-    assert not skill_ab.grade(task["check"], naive, NAIVE[task_id][1])[0], task_id
+    ctx = {"files": set(task["files"]), "commands": []}
+    assert skill_ab.grade(task["check"], good, GOOD[task_id][1], ctx)[0], task_id
+    assert not skill_ab.grade(task["check"], naive, NAIVE[task_id][1], ctx)[0], task_id
+    # 标准解法不能被误判为误用
+    assert all(skill_ab.grade(m, good, GOOD[task_id][1], ctx)[0] for m in task.get("misuse") or []), task_id
+
+
+@pytest.mark.parametrize("task_id", sorted(MISUSE))
+def test_misuse_is_detected(tmp_path, task_id):
+    task = TASKS[task_id]
+    files, answer, commands = MISUSE[task_id]
+    _apply(task, tmp_path, files)
+    ctx = {"files": set(task["files"]), "commands": commands}
+    assert skill_ab.grade(task["check"], tmp_path, answer, ctx)[0], task_id          # 任务本身做对了
+    assert not all(skill_ab.grade(m, tmp_path, answer, ctx)[0] for m in task["misuse"]), task_id
+
+
+def test_suite_is_consistent():
+    assert len(SUITE["tasks"]) == 18 and len(SUITE["learning"]) == 9 and len(SUITE["distractors"]) == 8
+    names = set(SUITE["skills"]) | set(SUITE["distractors"])
+    for t in SUITE["tasks"]:
+        assert set(t.get("skills") or []) <= set(SUITE["skills"]) and set(t.get("exclude_skills") or []) <= names
+        assert not set(t.get("skills") or []) & set(t.get("exclude_skills") or [])
+    kinds = [i["kind"] for i in SUITE["learning"]]
+    assert kinds.count("explicit") == 4 and kinds.count("implicit") == 3 and kinds.count("oneoff") == 2
+    for i in SUITE["learning"]:
+        assert i["test_task"] in TASKS and i["teaching_turns"] and i["teaching_turns_alt"]
+
+
+def test_skills_installed_per_condition():
+    spdx = TASKS["pref-spdx"]
+    on = skill_ab.skills_for(spdx, SUITE, "skills_on")
+    assert "license-header" in on and "project-layout" not in on and "docker-build" in on
+    assert len(on) == len(SUITE["skills"]) - 1 + len(SUITE["distractors"])
+    assert skill_ab.skills_for(spdx, SUITE, "skills_isolated") == {"license-header": SUITE["skills"]["license-header"]}
+    assert skill_ab.skills_for(spdx, SUITE, "skills_off") is None
+
+
+def test_reset_workspace_keeps_learned_state(tmp_path):
+    (tmp_path / ".moltevo" / "skills").mkdir(parents=True)
+    (tmp_path / "_home").mkdir()
+    (tmp_path / "data.json").write_text("{}")
+    (tmp_path / "src").mkdir()
+    skill_ab.reset_workspace(tmp_path)
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".moltevo", "_home"]
 
 
 def test_failure_lesson_fixtures_really_fail_without_the_trick(tmp_path):
@@ -114,6 +179,15 @@ def test_ab_experiment_end_to_end_with_fake_model(tmp_path, monkeypatch):
     assert summary["skills_on"]["passed"] == 2 and summary["skills_off"]["passed"] == 0
     assert summary["paired"]["only_skills_on"] == 2
     assert (tmp_path / "results.jsonl").read_text().count("\n") == 4
+    # 漏斗：开 Skill 组在 19 个 Skill 里检索到了目标；假模型没调用 skill 工具
+    funnel = summary["funnel"]["skills_on"]
+    assert funnel["runs"] == 2 and funnel["retrieval_recall_at_3"] == 1.0 and funnel["invocation_rate"] == 0.0
+    traj = tmp_path / "trajectories" / "pref-commit-msg-skills_on-1.jsonl"
+    types = [__import__("json").loads(l)["type"] for l in traj.read_text().splitlines()]
+    assert "skill_retrieved" in types and "model_call" in types and types[-1] == "final_messages"
+    report = (tmp_path / "report.md").read_text()
+    assert "## preference" in report and "Funnel" in report
+    assert skill_ab.report(tmp_path) == report
 
 
 def test_learning_experiment_end_to_end_with_fake_model(tmp_path, monkeypatch):
@@ -153,9 +227,24 @@ def test_learning_experiment_end_to_end_with_fake_model(tmp_path, monkeypatch):
         agent_kwargs={"model": "claude-sonnet-4-6", "api_key": "sk-test",
                       "anthropic_base_url": "https://fake.example/anthropic"}))
     rows = [_json.loads(l) for l in (tmp_path / "results.jsonl").read_text().splitlines()]
-    learned = next(r for r in rows if r["condition"] == "learned")
-    assert learned["skills_promoted"] == ["spdx-header"]
-    assert summary["learned"]["passed"] == 1 and summary["control"]["passed"] == 0
+    approved = next(r for r in rows if r["condition"] == "learned_approved")
+    gate = next(r for r in rows if r["condition"] == "learned_gate")
+    assert approved["skills_promoted"] == ["spdx-header"]
+    # 真实门禁：两段教学里同一个候选出现 2 次，自动晋升，不需要模拟批准
+    assert gate["skills_promoted"] == ["spdx-header"] and gate["pending_candidates"] == 0
+    assert summary["learned_approved"]["passed"] == 1 and summary["learned_gate"]["passed"] == 1
+    assert summary["control"]["passed"] == 0
+    assert summary["learning"]["promotion_rate"] == {"learned_approved": 1.0, "learned_gate": 1.0}
+    assert (tmp_path / "trajectories" / "pref-spdx-learned_gate-1-teach2.jsonl").exists()
+
+
+def test_one_off_instruction_counts_as_false_learning():
+    recs = [{"item_id": "o", "kind": "oneoff", "task_id": "t", "condition": c, "rep": 1, "passed": False, "error": "",
+             "skills_promoted": promoted}
+            for c, promoted in (("learned_approved", ["wip-commits"]), ("learned_gate", []), ("control", []))]
+    s = skill_ab.summarize_learning(recs)
+    assert s["learning"]["false_learning_rate"] == {"learned_approved": 1.0, "learned_gate": 0.0}
+    assert s["learning"]["promotion_rate"] == {"learned_approved": None, "learned_gate": None}
 
 
 def test_errored_runs_are_excluded_from_statistics():
